@@ -49,7 +49,6 @@ os.environ.setdefault("SECRET_KEY", "test-secret-key-for-pytest-only")
 from lingodiary import webapp  # noqa: E402  (must follow env var set)
 from lingodiary.webapp import JWT_ALGORITHM, JWT_SECRET, app  # noqa: E402
 
-
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 TEST_USERNAME = "testuser"
@@ -213,11 +212,17 @@ class TestGenerateStatus:
         r = self._get(client, tmp_user_dir)
         assert r.get_json()["done"] is True
 
-    def test_done_flag_set_on_error_marker(self, client, tmp_user_dir):
+    def test_error_marker_is_not_terminal(self, client, tmp_user_dir):
+        # Backfill steps keep running after a generation error; only the
+        # finish marker ends the run.
         log_path = tmp_user_dir / "output" / "output.log"
         log_path.write_text("ERROR: Generation failed\n")
         r = self._get(client, tmp_user_dir)
-        assert r.get_json()["done"] is True
+        assert r.get_json()["done"] is False
+
+    def test_invalid_offset_does_not_500(self, client, tmp_user_dir):
+        r = self._get(client, tmp_user_dir, offset="abc")
+        assert r.status_code == 200
 
 
 # ── /api/diary/entry ───────────────────────────────────────────────────────────
@@ -270,27 +275,45 @@ class TestAddDiaryEntry:
         assert data["sentences_added"] == 2
         assert data["warnings"] == []
 
-    def test_existing_day_returns_warning(self, client, tmp_user_dir):
-        from lingodiary.diary_json import DiaryJson
+    def test_existing_day_appends_without_deleting(self, client, tmp_user_dir):
+        from lingodiary.diary_json import (
+            DiaryDay,
+            DiaryJson,
+            Sentence,
+        )
 
-        fake_day = MagicMock()
-        fake_diary = DiaryJson()
+        diary = DiaryJson(
+            diaries=[
+                DiaryDay(
+                    date="2026/01/15",
+                    entries=[
+                        Sentence(index=0, input_language_sentence="One"),
+                        Sentence(index=1, input_language_sentence="Two"),
+                    ],
+                )
+            ]
+        )
         with (
-            patch("lingodiary.diary_json.load_diary_json", return_value=fake_diary),
+            patch("lingodiary.diary_json.load_diary_json", return_value=diary),
             patch("lingodiary.diary_json.save_diary_json"),
-            patch("lingodiary.diary_json.upsert_day", return_value=fake_diary),
-            patch("lingodiary.diary_json.get_day", return_value=fake_day),
         ):
             r = self._post(
                 client,
                 tmp_user_dir,
-                {"date": "2026-01-15", "sentences": ["Hello"]},
+                {"date": "2026-01-15", "sentences": ["Two", "Three"]},
             )
 
         assert r.status_code == 200
         data = r.get_json()
+        assert data["sentences_added"] == 1
+        assert data["sentences_skipped"] == 1
         assert len(data["warnings"]) == 1
-        assert "already existed" in data["warnings"][0]
+        assert [e.input_language_sentence for e in diary.diaries[0].entries] == [
+            "One",
+            "Two",
+            "Three",
+        ]
+        assert [e.index for e in diary.diaries[0].entries] == [0, 1, 2]
 
 
 # ── /api/lessons/score ─────────────────────────────────────────────────────────
@@ -354,3 +377,68 @@ class TestLessonScore:
                 {"date": "2026-01-01", "entry_index": 99, "score": 5},
             )
         assert r.status_code == 404
+
+
+# ── security / validation ──────────────────────────────────────────────────────
+
+
+class TestSyncFileTraversal:
+    def test_sibling_directory_with_shared_prefix_is_denied(self, client, tmp_user_dir):
+        out = tmp_user_dir / "output"
+        sibling = tmp_user_dir / "output2"
+        sibling.mkdir()
+        (sibling / "secret.txt").write_text("nope")
+        token = _mint_token()
+        r = client.get(
+            "/api/sync/file/../output2/secret.txt",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code in (403, 404)
+        assert b"nope" not in r.data
+        assert out.exists()
+
+    def test_token_query_param_rejected_outside_file_route(self, client, tmp_user_dir):
+        token = _mint_token()
+        r = client.get(f"/api/home?token={token}")
+        assert r.status_code == 401
+
+
+class TestLoginThrottle:
+    def test_repeated_failures_are_throttled(self, client, tmp_user_dir):
+        webapp._login_failures.clear()
+        codes = [
+            client.post(
+                "/api/login", json={"username": TEST_USERNAME, "password": "bad"}
+            ).status_code
+            for _ in range(webapp._LOGIN_MAX_FAILURES + 1)
+        ]
+        assert codes[-1] == 429
+        webapp._login_failures.clear()
+
+
+class TestInputValidation:
+    def test_unknown_variant_returns_400(self, client, tmp_user_dir):
+        token = _mint_token()
+        r = client.get(
+            "/api/lessons/entries/2026-01-01/reviewing",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 400
+
+    def test_non_numeric_entry_index_returns_400(self, client, tmp_user_dir):
+        token = _mint_token()
+        r = client.post(
+            "/api/lessons/score",
+            json={"date": "2026-01-01", "entry_index": "x", "score": 3},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 400
+
+    def test_bad_last_reviewed_timestamp_returns_400(self, client, tmp_user_dir):
+        token = _mint_token()
+        r = client.put(
+            "/api/lessons/last_reviewed/2026-01-01",
+            json={"timestamp": "yesterday-ish"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 400

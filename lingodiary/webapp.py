@@ -4,11 +4,12 @@ import os
 import re
 import traceback
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
 import queue
-from threading import Thread
+import time
+from threading import Lock, Thread
 
 import jwt
 
@@ -16,7 +17,6 @@ import bcrypt
 import yaml
 from flask import (
     Flask,
-    Response,
     g,
     jsonify,
     request,
@@ -33,6 +33,15 @@ from lingodiary.diary import (
 )
 
 app = Flask(__name__)
+
+# When running behind a reverse proxy, set TRUST_PROXY=<number of proxies> so
+# request.remote_addr is the real client (used by the login throttle).  Off by
+# default: trusting X-Forwarded-For without a proxy lets clients spoof their IP.
+_trust_proxy = int(os.getenv("TRUST_PROXY", "0") or 0)
+if _trust_proxy > 0:
+    from werkzeug.middleware.proxy_fix import ProxyFix
+
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=_trust_proxy)
 _secret_key = os.getenv("SECRET_KEY", "super-secret-key")
 if _secret_key == "super-secret-key":
     raise RuntimeError(
@@ -44,7 +53,7 @@ JWT_SECRET = _secret_key
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_HOURS = 24 * 7  # 7 days
 
-# Bounded job queue — at most 1 pending job (current + 1 queued).
+# Bounded job queue — at most 2 queued jobs besides the one currently running.
 _job_queue: queue.Queue = queue.Queue(maxsize=2)
 
 
@@ -94,9 +103,9 @@ def add_cache_headers(response):
     """Add cache-control headers to prevent browser caching of API responses."""
     # API responses should not be cached by the browser to avoid stale data issues
     if request.path.startswith("/api/"):
-        response.headers[
-            "Cache-Control"
-        ] = "no-cache, no-store, must-revalidate, max-age=0"
+        response.headers["Cache-Control"] = (
+            "no-cache, no-store, must-revalidate, max-age=0"
+        )
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
     return response
@@ -110,7 +119,9 @@ _WEB_BUILD_DIR = os.path.join(os.path.dirname(__file__), "..", "web_build")
 @app.route("/<path:subpath>")
 def serve_flutter_web(subpath=""):
     """Serve the Flutter web app for all non-API routes."""
-    full = os.path.join(_WEB_BUILD_DIR, subpath)
+    if subpath.startswith("api/"):
+        return jsonify({"error": "Not found"}), 404
+    full = os.path.realpath(os.path.join(_WEB_BUILD_DIR, subpath))
     if subpath and os.path.isfile(full):
         return send_from_directory(_WEB_BUILD_DIR, subpath)
     # For unknown paths (SPA routes) serve index.html so go_router handles it.
@@ -159,6 +170,51 @@ def get_mp3_variants(folder):
     return display_items
 
 
+_SYNC_SKIP_NAMES = {"diary.json", "segments.json"}
+
+
+def _is_within(path: str, root: str) -> bool:
+    """True if *path* (already realpath'd) is *root* or inside it."""
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:  # different drives / mixed absolute+relative
+        return False
+
+
+def _int_arg(name: str, default: int, minimum: int = 0, maximum: int = 10_000) -> int:
+    """Parse an integer query arg, clamped; falls back to *default* when invalid."""
+    try:
+        value = int(request.args.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _parse_iso_utc(value) -> datetime | None:
+    """Parse an ISO-8601 string to an aware UTC datetime, or None if invalid."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _json_diary_backup(json_path: str) -> None:
+    """Copy diary.json into <output>/.backup before a destructive overwrite."""
+    import shutil
+
+    if not os.path.exists(json_path):
+        return
+    backup_dir = Path(json_path).parent / ".backup"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    shutil.copy2(json_path, backup_dir / f"diary_{ts}.json")
+
+
 # REST API for mobile app
 # ---------------------------------------------------------------------------
 
@@ -171,8 +227,9 @@ def _jwt_required(f):
         auth = request.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
             token = auth[len("Bearer ") :]
-        elif request.args.get("token"):
-            # Fallback for media streaming (e.g. HTML5 audio can't set headers)
+        elif request.endpoint == "api_sync_file" and request.args.get("token"):
+            # Only for media streaming (HTML5 audio can't set headers); accepting
+            # tokens in the URL elsewhere would leak them into logs and proxies.
             token = request.args["token"]
         else:
             return jsonify({"error": "Missing or invalid Authorization header"}), 401
@@ -192,19 +249,38 @@ def _jwt_required(f):
         # Load config directly (no DiaryHandler instantiation) to avoid a race
         # condition where stop() would destroy the background generation thread's
         # file log handler on every polling request.
-        from flask import g as _g
-
         config = DiaryHandler.load_config(user_config_path)
-        _g.api_username = username
-        _g.api_config_path = user_config_path
-        _g.api_output_folder = config["output_dir"]
-        _g.api_tprs_folder = os.path.join(_g.api_output_folder, "TPRS")
-        _g.api_json_diary_path = config.get("json_diary_path") or os.path.join(
-            _g.api_output_folder, "diary.json"
+        g.api_username = username
+        g.api_config_path = user_config_path
+        g.api_output_folder = config["output_dir"]
+        g.api_tprs_folder = os.path.join(g.api_output_folder, "TPRS")
+        g.api_json_diary_path = config.get("json_diary_path") or os.path.join(
+            g.api_output_folder, "diary.json"
         )
         return f(*args, **kwargs)
 
     return decorated
+
+
+_LOGIN_WINDOW_S = 300
+_LOGIN_MAX_FAILURES = 10
+_login_failures: dict[str, list[float]] = defaultdict(list)
+_login_lock = Lock()
+# Verified against when the user doesn't exist, so timing doesn't reveal usernames.
+_DUMMY_HASH = bcrypt.hashpw(b"dummy-password", bcrypt.gensalt())
+
+
+def _login_throttled(key: str) -> bool:
+    now = time.monotonic()
+    with _login_lock:
+        recent = [t for t in _login_failures[key] if now - t < _LOGIN_WINDOW_S]
+        _login_failures[key] = recent
+        return len(recent) >= _LOGIN_MAX_FAILURES
+
+
+def _login_record_failure(key: str) -> None:
+    with _login_lock:
+        _login_failures[key].append(time.monotonic())
 
 
 @app.route("/api/login", methods=["POST"])
@@ -213,22 +289,38 @@ def api_login():
     username = data.get("username", "")
     password = data.get("password", "")
 
+    if not isinstance(username, str) or not isinstance(password, str):
+        return jsonify({"error": "username and password required"}), 400
     if not username or not password:
         return jsonify({"error": "username and password required"}), 400
 
-    with open(USER_DB_FILE) as f_db:
-        users = yaml.safe_load(f_db)
+    throttle_key = f"{request.remote_addr}|{username}"
+    if _login_throttled(throttle_key):
+        return jsonify({"error": "Too many failed attempts. Try again later."}), 429
 
-    if username not in users.get("users", {}) or not bcrypt.checkpw(
-        password.encode(), users["users"][username]["password"].encode()
-    ):
+    try:
+        with open(USER_DB_FILE) as f_db:
+            users = (yaml.safe_load(f_db) or {}).get("users") or {}
+    except OSError:
+        app.logger.error(f"Cannot read user database {USER_DB_FILE}")
+        return jsonify({"error": "Server misconfigured"}), 500
+
+    user = users.get(username)
+    stored = (user or {}).get("password", "") if isinstance(user, dict) else ""
+    hashed = stored.encode() if stored else _DUMMY_HASH
+    try:
+        password_ok = bcrypt.checkpw(password.encode(), hashed) and bool(stored)
+    except ValueError:  # malformed hash in users.yaml
+        password_ok = False
+    if not password_ok:
+        _login_record_failure(throttle_key)
         return jsonify({"error": "Invalid credentials"}), 401
 
     user_config_path = os.path.join(CONFIG_ROOT, username, "config.yaml")
     if not os.path.exists(user_config_path):
         return jsonify({"error": "No config found for this user"}), 403
 
-    expiry = datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS)
+    expiry = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS)
     token = jwt.encode(
         {"sub": username, "exp": expiry}, JWT_SECRET, algorithm=JWT_ALGORITHM
     )
@@ -266,11 +358,8 @@ def api_save_diary():
 @app.route("/api/generate", methods=["POST"])
 @_jwt_required
 def api_generate():
-    from flask import g as _g
-    import yaml
-
-    config_path = _g.api_config_path
-    output_folder = _g.api_output_folder
+    config_path = g.api_config_path
+    output_folder = g.api_output_folder
 
     def _run():
         log_file = os.path.join(output_folder, "output.log")
@@ -290,26 +379,16 @@ def api_generate():
             except Exception:
                 pass
 
-        # Back up diary.json before anything mutates it.
+        # Back up diary.json before anything mutates it; prune old backups.
         try:
-            import shutil
-            from datetime import datetime as _dt, timezone as _tz
-            from pathlib import Path as _Path
-
-            json_src = os.path.join(output_folder, "diary.json")
-            if os.path.exists(json_src):
-                backup_dir = _Path(output_folder) / ".backup"
-                backup_dir.mkdir(parents=True, exist_ok=True)
-                ts = _dt.now(_tz.utc).strftime("%Y%m%dT%H%M%SZ")
-                shutil.copy2(json_src, backup_dir / f"diary_{ts}.json")
-                # Prune backups older than 7 days
-                cutoff = _dt.now(_tz.utc).timestamp() - 7 * 86400
-                for old in backup_dir.glob("diary_*.json"):
-                    try:
-                        if old.stat().st_mtime < cutoff:
-                            old.unlink()
-                    except OSError:
-                        pass
+            _json_diary_backup(os.path.join(output_folder, "diary.json"))
+            cutoff = time.time() - 7 * 86400
+            for old in (Path(output_folder) / ".backup").glob("diary_*.json"):
+                try:
+                    if old.stat().st_mtime < cutoff:
+                        old.unlink()
+                except OSError:
+                    pass
         except Exception as exc:
             app.logger.warning(f"diary.json backup failed: {exc}")
 
@@ -335,23 +414,26 @@ def api_generate():
             _detach_output_log(at_logger, at_handler)
         # 2. Q&A translations — needed for flashcard review.
         try:
-            TprsCreation(config_path).backfill_qa_translations(json_path)
+            TprsCreation(config_path, generate_missing=False).backfill_qa_translations(
+                json_path
+            )
         except Exception as exc:
             app.logger.warning(f"Q&A translation backfill failed: {exc}")
             _log_to_file(f"WARNING: Q&A translation backfill failed: {exc}")
         # 3. sentence_input translations — low-priority metadata; runs last
         #    because it iterates ALL historical entries and can be slow.
         try:
-            TprsCreation(config_path).backfill_sentence_inputs(json_path)
+            TprsCreation(config_path, generate_missing=False).backfill_sentence_inputs(
+                json_path
+            )
         except Exception as exc:
             app.logger.warning(f"sentence_input backfill failed: {exc}")
             _log_to_file(f"WARNING: sentence_input backfill failed: {exc}")
         # 4. Drive Mode Input Language audio — only if input_voice is configured.
         try:
-            import yaml as _yaml
 
             with open(config_path, encoding="utf-8") as _cf:
-                _cfg = _yaml.safe_load(_cf)
+                _cfg = yaml.safe_load(_cf)
             if _cfg.get("tts", {}).get("piper_input_language", {}).get("voice"):
                 from lingodiary.audio_timing import backfill_drive_mode_audio
 
@@ -385,15 +467,16 @@ def api_generate():
 @_jwt_required
 def api_backfill_qa_translations():
     """Background job: translate all missing Q&A pairs to the primary language."""
-    from flask import g as _g
 
-    config_path = _g.api_config_path
-    output_folder = _g.api_output_folder
+    config_path = g.api_config_path
+    output_folder = g.api_output_folder
 
     def _run():
         try:
             json_path = os.path.join(output_folder, "diary.json")
-            TprsCreation(config_path).backfill_qa_translations(json_path)
+            TprsCreation(config_path, generate_missing=False).backfill_qa_translations(
+                json_path
+            )
         except Exception as exc:
             app.logger.error(f"Q&A translation backfill error: {exc}")
 
@@ -418,12 +501,11 @@ def api_backfill_audio_timing():
     days (slow).  Without the flag (default false), only recomputes timing from existing
     segment files when zero timing is detected — much faster.
     """
-    from flask import g as _g, request as _req
 
-    config_path = _g.api_config_path
-    output_folder = _g.api_output_folder
+    config_path = g.api_config_path
+    output_folder = g.api_output_folder
 
-    body = _req.get_json(silent=True) or {}
+    body = request.get_json(silent=True) or {}
     overwrite = bool(body.get("overwrite", False))
 
     def _run():
@@ -471,10 +553,9 @@ def api_backfill_all():
       2. backfill_qa_translations    (translate missing Q&A pairs)
       3. backfill_sentence_inputs    (translate missing variant sentence_input fields — slow, runs last)
     """
-    from flask import g as _g
 
-    config_path = _g.api_config_path
-    output_folder = _g.api_output_folder
+    config_path = g.api_config_path
+    output_folder = g.api_output_folder
 
     def _run():
         log_file = os.path.join(output_folder, "output.log")
@@ -494,7 +575,9 @@ def api_backfill_all():
 
             app.logger.info("Backfill all: step 2/3 — Q&A translations")
             try:
-                TprsCreation(config_path).backfill_qa_translations(json_path)
+                TprsCreation(
+                    config_path, generate_missing=False
+                ).backfill_qa_translations(json_path)
             except Exception as exc:
                 app.logger.warning(f"Backfill all: Q&A translation failed: {exc}")
 
@@ -502,7 +585,9 @@ def api_backfill_all():
                 "Backfill all: step 3/3 — variant sentence_input translations"
             )
             try:
-                TprsCreation(config_path).backfill_sentence_inputs(json_path)
+                TprsCreation(
+                    config_path, generate_missing=False
+                ).backfill_sentence_inputs(json_path)
             except Exception as exc:
                 app.logger.warning(
                     f"Backfill all: sentence_input backfill failed: {exc}"
@@ -541,17 +626,15 @@ def api_backfill_drive_mode_audio(date: str | None = None):
     Requires ``tts.piper_input_language.voice`` in the user config; returns 400 if absent.
     Progress is written to ``output.log`` and readable via ``GET /api/generate/status``.
     """
-    from flask import g as _g
 
-    config_path = _g.api_config_path
-    output_folder = _g.api_output_folder
+    config_path = g.api_config_path
+    output_folder = g.api_output_folder
 
     # Validate that input_voice is configured before queueing the job.
     try:
-        import yaml as _yaml
 
         with open(config_path, encoding="utf-8") as _cf:
-            _cfg = _yaml.safe_load(_cf)
+            _cfg = yaml.safe_load(_cf)
         if not _cfg.get("tts", {}).get("piper_input_language", {}).get("voice"):
             return (
                 jsonify(
@@ -608,44 +691,48 @@ def api_backfill_drive_mode_audio(date: str | None = None):
 @app.route("/api/generate/status", methods=["GET"])
 @_jwt_required
 def api_generate_status():
-    from flask import g as _g, request
-
-    log_file = os.path.join(_g.api_output_folder, "output.log")
-    offset = int(request.args.get("offset", 0))
+    log_file = os.path.join(g.api_output_folder, "output.log")
+    offset = _int_arg("offset", 0, 0, 2**40)
     chunk = ""
     new_offset = offset
-    done = False
 
     if os.path.exists(log_file):
-        with open(log_file, "r", encoding="utf-8") as f:
+        # Binary mode: offsets are byte positions, stable across calls.
+        with open(log_file, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            if offset > f.tell():  # log was truncated by a new run
+                offset = 0
             f.seek(offset)
-            chunk = f.read()
-            new_offset = f.tell()
+            raw = f.read()
+        # Never split a multi-byte character or a half-written line.
+        cut = raw.rfind(b"\n") + 1
+        if cut:
+            raw = raw[:cut]
+        chunk = raw.decode("utf-8", errors="replace")
+        new_offset = offset + len(raw)
 
-    done = any(
-        marker in chunk
-        for marker in ("=== Generation finished ===", "ERROR: Generation failed")
-    )
+    # "ERROR: Generation failed" is NOT terminal: the backfill steps still run
+    # after it and the finish marker is always written last.
+    done = "=== Generation finished ===" in chunk
     return jsonify({"log": chunk, "offset": new_offset, "done": done})
 
 
 @app.route("/api/lessons", methods=["GET"])
 @_jwt_required
 def api_lessons():
-    from flask import g as _g
 
     result = []
     diary = None
     try:
         from lingodiary.diary_json import load_diary_json
 
-        diary = load_diary_json(_g.api_json_diary_path)
+        diary = load_diary_json(g.api_json_diary_path)
     except Exception:
         diary = None
 
     if diary is None:
         # Fallback: no diary.json — return filesystem-scanned items with no metadata
-        for base, display, variants in get_mp3_variants(_g.api_tprs_folder):
+        for base, display, variants in get_mp3_variants(g.api_tprs_folder):
             result.append({"base": base, "display": display, "variants": variants})
         return jsonify({"lessons": result})
 
@@ -696,9 +783,8 @@ def api_lessons():
 @_jwt_required
 def api_sync_manifest():
     """Return a manifest of all syncable files (mp3 + md) with size and mtime."""
-    from flask import g as _g
 
-    output_folder = _g.api_output_folder
+    output_folder = g.api_output_folder
     manifest = []
     for root, _, files in os.walk(output_folder):
         for fname in files:
@@ -706,7 +792,7 @@ def api_sync_manifest():
                 fname.startswith(".")
                 or fname.endswith(".zip")
                 or fname.endswith(".log")
-                or fname == "diary.json"
+                or fname in _SYNC_SKIP_NAMES
             ):
                 continue
             full = os.path.join(root, fname)
@@ -726,162 +812,94 @@ def api_sync_manifest():
 @_jwt_required
 def api_sync_file(rel_path):
     """Download a single output file by its relative path."""
-    from flask import g as _g
 
-    output_folder = _g.api_output_folder
+    output_folder = g.api_output_folder
     # Security: resolve and ensure the path stays within output_folder
     safe_path = os.path.realpath(os.path.join(output_folder, rel_path))
-    if not safe_path.startswith(os.path.realpath(output_folder)):
+    if not _is_within(safe_path, os.path.realpath(output_folder)):
         return jsonify({"error": "Access denied"}), 403
-    if not os.path.exists(safe_path):
+    if not os.path.isfile(safe_path):
         return jsonify({"error": "File not found"}), 404
     return send_file(safe_path, as_attachment=True)
+
+
+def _audio_paths_of(v_obj) -> list[str]:
+    """All audio file paths referenced by one SentenceBlock (incl. Drive Mode)."""
+    paths = [v_obj.sentence_audio_path, v_obj.sentence_input_language_audio_path]
+    for qa in v_obj.qa:
+        paths += [
+            qa.question_audio_path,
+            qa.question_input_language_audio_path,
+            qa.answer_audio_path,
+            qa.answer_input_language_audio_path,
+        ]
+    return [p for p in paths if p]
 
 
 @app.route("/api/sync/manifest/<path:base>", methods=["GET"])
 @_jwt_required
 def api_sync_lesson_manifest(base):
-    """Return manifest filtered to files belonging to a single lesson (by base name),
+    """Manifest filtered to files belonging to a single lesson (by base name),
     including all primary variants and nested Drive Mode assets.
     """
-    from flask import g as _g
-    from lingodiary.diary_json import load_diary_json
+    from lingodiary.diary_json import VARIANTS, load_diary_json
 
-    output_folder = _g.api_output_folder
+    output_folder = g.api_output_folder
+    root_real = os.path.realpath(output_folder)
 
-    # 1. Collect your core files via the existing folder-scan fallback rule
+    # 1. Files whose relative path contains the lesson base name.
     matched_paths = set()
     for root, _, files in os.walk(output_folder):
         for fname in files:
-            if (
-                fname.startswith(".")
-                or fname.endswith(".zip")
-                or fname.endswith(".log")
-            ):
+            if fname.startswith(".") or fname in _SYNC_SKIP_NAMES:
                 continue
-            full = os.path.join(root, fname)
-            rel = os.path.relpath(full, output_folder)
+            if fname.endswith((".zip", ".log")):
+                continue
+            rel = os.path.relpath(os.path.join(root, fname), output_folder)
             if base in rel:
                 matched_paths.add(rel)
 
-    # 2. Extract nested Drive Mode/Q&A tracks explicitly from diary.json data
+    # 2. Segment files referenced from diary.json for the matching day.
     try:
-        diary = load_diary_json(_g.api_json_diary_path)
-
-        # Helper to clean path names for manifest list
-        def clean_rel_path(raw_path):
-            if not raw_path:
-                return ""
-            # Strip folder prefixes if your json stores full paths (e.g. "TPRS/file.mp3")
-            # to make sure it matches your raw filesystem walk output layout
-            return raw_path
-
+        diary = load_diary_json(g.api_json_diary_path)
         for day in diary.diaries:
-            # Locate the target day configuration matching this specific base name
             original_path = day.lesson_audio_paths.get("original", "")
             day_base = (
                 os.path.splitext(os.path.basename(original_path))[0]
                 if original_path
                 else ""
             )
-
-            if day_base == base or base in day_base:
-                for entry in day.entries:
-                    # Look inside all variants (original, enhanced, present, future)
-                    for variant_name in ["original", "enhanced", "present", "future"]:
-                        v_obj = entry.lessons.get_variant(variant_name)
-                        if not v_obj:
-                            continue
-
-                        # Gather the 2 core sentence paths
-                        if v_obj.sentence_audio_path:
-                            matched_paths.add(clean_rel_path(v_obj.sentence_audio_path))
-                        if v_obj.sentence_input_language_audio_path:
-                            matched_paths.add(
-                                clean_rel_path(v_obj.sentence_input_language_audio_path)
-                            )
-
-                        # Deep dive into the 4 types inside your interactive Q&A loops
-                        for qa in v_obj.qa:
-                            if qa.question_audio_path:
-                                matched_paths.add(
-                                    clean_rel_path(qa.question_audio_path)
-                                )
-                            if qa.question_input_language_audio_path:
-                                matched_paths.add(
-                                    clean_rel_path(
-                                        qa.question_input_language_audio_path
-                                    )
-                                )
-                            if qa.answer_audio_path:
-                                matched_paths.add(clean_rel_path(qa.answer_audio_path))
-                            if qa.answer_input_language_audio_path:
-                                matched_paths.add(
-                                    clean_rel_path(qa.answer_input_language_audio_path)
-                                )
+            if not day_base or base not in day_base:
+                continue
+            for entry in day.entries:
+                for variant_name in VARIANTS:
+                    matched_paths.update(
+                        _audio_paths_of(entry.lessons.get_variant(variant_name))
+                    )
     except Exception as exc:
-        app.logger.warning(
-            f"Failed parsing diary.json context inside manifest route: {exc}"
+        app.logger.warning(f"Failed parsing diary.json inside manifest route: {exc}")
+
+    manifest = []
+    for rel_path in sorted(matched_paths):
+        full_path = os.path.realpath(os.path.join(output_folder, rel_path))
+        # diary.json is user-writable data: never follow paths out of the output dir
+        if not _is_within(full_path, root_real) or not os.path.isfile(full_path):
+            continue
+        stat = os.stat(full_path)
+        manifest.append(
+            {"path": rel_path, "size": stat.st_size, "mtime": stat.st_mtime}
         )
 
-    # 3. Formulate the precise file objects expected by sync_manager.dart
-    manifest = []
-    for rel_path in matched_paths:
-        full_path = os.path.join(output_folder, rel_path)
-        if os.path.exists(full_path):
-            stat = os.stat(full_path)
-            manifest.append(
-                {
-                    "path": rel_path,
-                    "size": stat.st_size,
-                    "mtime": stat.st_mtime,
-                }
-            )
-
     return jsonify({"manifest": manifest})
-
-
-#
-# @app.route("/api/sync/manifest/<path:base>", methods=["GET"])
-# @_jwt_required
-# def api_sync_lesson_manifest(base):
-#     """Return manifest filtered to files belonging to a single lesson (by base name)."""
-#     from flask import g as _g
-#
-#     output_folder = _g.api_output_folder
-#     manifest = []
-#     for root, _, files in os.walk(output_folder):
-#         for fname in files:
-#             if (
-#                 fname.startswith(".")
-#                 or fname.endswith(".zip")
-#                 or fname.endswith(".log")
-#             ):
-#                 continue
-#             full = os.path.join(root, fname)
-#             rel = os.path.relpath(full, output_folder)
-#             if base not in rel:
-#                 continue
-#             stat = os.stat(full)
-#             manifest.append(
-#                 {
-#                     "path": rel,
-#                     "size": stat.st_size,
-#                     "mtime": stat.st_mtime,
-#                 }
-#             )
-#     return jsonify({"manifest": manifest})
-#
 
 
 @app.route("/api/diary/json", methods=["GET"])
 @_jwt_required
 def api_get_diary_json():
     """Return the full diary JSON for the authenticated user."""
-    from flask import g as _g
     from lingodiary.diary_json import load_diary_json
 
-    json_path = _g.api_json_diary_path
+    json_path = g.api_json_diary_path
     if not os.path.exists(json_path):
         return jsonify({"diaries": []})
     try:
@@ -895,12 +913,11 @@ def api_get_diary_json():
 @_jwt_required
 def api_diary_day(date):
     """Return the complete Day object for a given date (all variants, all entries, title, etc.)."""
-    from flask import g as _g
     from lingodiary.diary_json import load_diary_json, get_day
 
     date_slash = date.replace("-", "/")
     try:
-        diary = load_diary_json(_g.api_json_diary_path)
+        diary = load_diary_json(g.api_json_diary_path)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
@@ -915,31 +932,37 @@ def api_diary_day(date):
 @_jwt_required
 def api_post_diary_json():
     """Overwrite diary JSON (full replace, for migration tool)."""
-    from flask import g as _g
-    from lingodiary.diary_json import DiaryJson, save_diary_json
+    from lingodiary.diary_json import DiaryJson, diary_lock, save_diary_json
 
     data = request.get_json(silent=True)
-    if data is None:
-        return jsonify({"error": "Invalid JSON body"}), 400
+    if not isinstance(data, dict) or not isinstance(data.get("diaries"), list):
+        return jsonify({"error": "Body must be an object with a 'diaries' list"}), 400
     try:
         diary = DiaryJson.from_dict(data)
-        save_diary_json(diary, _g.api_json_diary_path)
+        with diary_lock(g.api_json_diary_path):
+            _json_diary_backup(g.api_json_diary_path)
+            save_diary_json(diary, g.api_json_diary_path)
         return jsonify({"ok": True})
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        app.logger.error(f"api_post_diary_json error: {exc}")
+        return jsonify({"error": "Could not save diary"}), 400
 
 
 @app.route("/api/lessons/entries/<date>/<variant>", methods=["GET"])
 @_jwt_required
 def api_lesson_entries(date, variant):
     """Return entries list with audio timings for a given date and variant."""
-    from flask import g as _g
     from lingodiary.diary_json import load_diary_json, get_day
+
+    from lingodiary.diary_json import VARIANTS
+
+    if variant not in VARIANTS:
+        return jsonify({"error": f"variant must be one of {list(VARIANTS)}"}), 400
 
     # Normalise date to YYYY/MM/DD
     date_slash = date.replace("-", "/")
     try:
-        diary = load_diary_json(_g.api_json_diary_path)
+        diary = load_diary_json(g.api_json_diary_path)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
@@ -973,9 +996,17 @@ def api_lesson_entries(date, variant):
 @app.route("/api/lessons/score", methods=["POST"])
 @_jwt_required
 def api_lesson_score():
-    """Apply SM-2 score to a diary entry. Body: {date, entry_index, score}."""
-    from flask import g as _g
-    from lingodiary.diary_json import load_diary_json, save_diary_json, update_srs
+    """Apply SM-2 score to a diary entry.
+
+    Body: {date, entry_index, score, scored_at?}.  ``scored_at`` (ISO-8601) lets
+    the app replay offline reviews with the time they actually happened.
+    """
+    from lingodiary.diary_json import (
+        diary_lock,
+        load_diary_json,
+        save_diary_json,
+        update_srs,
+    )
 
     data = request.get_json(silent=True) or {}
     date = data.get("date", "")
@@ -984,18 +1015,34 @@ def api_lesson_score():
 
     if not date or entry_index is None or score is None:
         return jsonify({"error": "date, entry_index, and score are required"}), 400
-    if score not in (0, 2, 3, 5):
+    if isinstance(score, bool) or score not in (0, 2, 3, 5):
         return jsonify({"error": "score must be one of 0, 2, 3, 5"}), 400
-
-    date_slash = date.replace("-", "/")
     try:
-        diary = load_diary_json(_g.api_json_diary_path)
-        diary, reviewing = update_srs(diary, date_slash, int(entry_index), int(score))
-        save_diary_json(diary, _g.api_json_diary_path)
+        entry_index = int(entry_index)
+    except (TypeError, ValueError):
+        return jsonify({"error": "entry_index must be an integer"}), 400
+
+    scored_at = None
+    if data.get("scored_at"):
+        scored_at = _parse_iso_utc(data["scored_at"])
+        if scored_at is None:
+            return jsonify({"error": "scored_at must be an ISO-8601 timestamp"}), 400
+        if scored_at > datetime.now(timezone.utc):
+            scored_at = None  # clock skew: never schedule from the future
+
+    date_slash = str(date).replace("-", "/")
+    try:
+        with diary_lock(g.api_json_diary_path):
+            diary = load_diary_json(g.api_json_diary_path)
+            diary, reviewing = update_srs(
+                diary, date_slash, entry_index, int(score), now=scored_at
+            )
+            save_diary_json(diary, g.api_json_diary_path)
         return jsonify({"ok": True, "reviewing": reviewing.to_dict()})
     except ValueError:
         return jsonify({"error": "Entry not found"}), 404
     except Exception as exc:
+        app.logger.error(f"api_lesson_score error: {exc}")
         return jsonify({"error": str(exc)}), 500
 
 
@@ -1003,16 +1050,14 @@ def api_lesson_score():
 @_jwt_required
 def api_home():
     """Dashboard: stats + recent + recommended lesson."""
-    from flask import g as _g
     from lingodiary.diary_json import (
         load_diary_json,
         compute_stats,
         get_due_entries,
-        get_recently_reviewed,
     )
 
     try:
-        diary = load_diary_json(_g.api_json_diary_path)
+        diary = load_diary_json(g.api_json_diary_path)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
@@ -1074,23 +1119,24 @@ def api_sentences_due():
       limit  (int, default 20)  — max sentences to return
       variant (str, default "original") — which variant lesson to pull sentence/qa from
     """
-    from flask import g as _g
     from lingodiary.diary_json import load_diary_json, get_due_entries
 
-    limit = int(request.args.get("limit", 20))
+    from lingodiary.diary_json import VARIANTS
+
+    limit = _int_arg("limit", 20, 1, 500)
     variant = request.args.get("variant", "original")
+    if variant not in VARIANTS:
+        return jsonify({"error": f"variant must be one of {list(VARIANTS)}"}), 400
 
     try:
-        diary = load_diary_json(_g.api_json_diary_path)
+        diary = load_diary_json(g.api_json_diary_path)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
     due_pairs = get_due_entries(diary)[:limit]
     sentences = []
     for day, entry in due_pairs:
-        vl = getattr(entry.lessons, variant, None)
-        if vl is None:
-            continue
+        vl = entry.lessons.get_variant(variant)
         sentences.append(
             {
                 "date": day.date,
@@ -1113,8 +1159,21 @@ def api_sentences_due():
 @app.route("/api/diary/entry", methods=["POST"])
 @_jwt_required
 def api_add_diary_entry():
-    """Add a structured diary entry: {date: 'YYYY-MM-DD', sentences: [...]}."""
-    from flask import g as _g
+    """Add sentences to a day: {date: 'YYYY-MM-DD', sentences: [...]}.
+
+    Never deletes or renumbers existing sentences.  Sentences already present on
+    that day (same text) are skipped, so replaying an offline request is safe.
+    """
+    from lingodiary.diary_json import (
+        ReviewingState,
+        Sentence,
+        VariantSet,
+        diary_lock,
+        get_day,
+        load_diary_json,
+        save_diary_json,
+        upsert_day,
+    )
 
     data = request.get_json(silent=True) or {}
     selected_date = data.get("date", "")
@@ -1122,56 +1181,73 @@ def api_add_diary_entry():
 
     if not selected_date or not sentences:
         return jsonify({"error": "date and sentences are required"}), 400
+    if not isinstance(sentences, list) or not all(
+        isinstance(s, str) for s in sentences
+    ):
+        return jsonify({"error": "sentences must be a list of strings"}), 400
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if not sentences:
+        return jsonify({"error": "date and sentences are required"}), 400
 
     try:
         datetime.strptime(selected_date, "%Y-%m-%d")
     except ValueError:
         return jsonify({"error": "Invalid date format, expected YYYY-MM-DD"}), 400
 
+    json_path = g.api_json_diary_path
+    if not json_path:
+        return jsonify({"error": "json_diary_path not configured"}), 500
+
     try:
-        from lingodiary.diary_json import (
-            Sentence,
-            VariantSet,
-            ReviewingState,
-            get_day,
-            load_diary_json,
-            save_diary_json,
-            upsert_day,
-        )
-
-        json_path = _g.api_json_diary_path
-        if not json_path:
-            return jsonify({"error": "json_diary_path not configured"}), 500
-
         date_slash = selected_date.replace("-", "/")
-        diary_json = load_diary_json(json_path)
-        day_existed = get_day(diary_json, date_slash) is not None
-        entries = [
-            Sentence(
-                index=i + 1,
-                input_language_sentence=s,
-                lessons=VariantSet(reviewing=ReviewingState()),
+        with diary_lock(json_path):
+            diary_json = load_diary_json(json_path)
+            day = get_day(diary_json, date_slash)
+            day_existed = day is not None
+            known = (
+                {e.input_language_sentence.strip() for e in day.entries}
+                if day
+                else set()
             )
-            for i, s in enumerate(sentences)
-        ]
-        diary_json = upsert_day(diary_json, date_slash, "", entries)
-        save_diary_json(diary_json, json_path)
+            next_index = (
+                max((e.index for e in day.entries), default=0) + 1 if day else 1
+            )
+
+            new_entries = []
+            for text in sentences:
+                if text in known:
+                    continue
+                known.add(text)
+                new_entries.append(
+                    Sentence(
+                        index=next_index,
+                        input_language_sentence=text,
+                        lessons=VariantSet(reviewing=ReviewingState()),
+                    )
+                )
+                next_index += 1
+
+            if new_entries:
+                diary_json = upsert_day(diary_json, date_slash, "", new_entries)
+                save_diary_json(diary_json, json_path)
     except Exception as exc:
         app.logger.error(f"api_add_diary_entry error: {exc}")
         return jsonify({"error": str(exc)}), 500
 
+    warnings = []
+    if day_existed and new_entries:
+        warnings.append(
+            f"Day {selected_date} already existed — new sentences were appended. "
+            "Audio will need to be regenerated."
+        )
+    skipped = len(sentences) - len(new_entries)
     return jsonify(
         {
             "success": True,
             "date": selected_date,
-            "sentences_added": len(sentences),
-            "warnings": (
-                [
-                    f"Day {selected_date} already existed — new sentences were merged into the existing day. Audio will need to be regenerated."
-                ]
-                if day_existed
-                else []
-            ),
+            "sentences_added": len(new_entries),
+            "sentences_skipped": skipped,
+            "warnings": warnings,
         }
     )
 
@@ -1180,37 +1256,40 @@ def api_add_diary_entry():
 @_jwt_required
 def api_save_trials(date):
     """Save user_trial_translation for each sentence of a day.
-    Body: {"trials": ["attempt1", "attempt2", ...]} ordered by sentence index (1-based).
+    Body: {"trials": ["attempt1", "attempt2", ...]} in the day's display order.
     """
-    from flask import g as _g
+    from lingodiary.diary_json import (
+        diary_lock,
+        get_day,
+        load_diary_json,
+        save_diary_json,
+    )
 
     data = request.get_json(silent=True) or {}
     trials = data.get("trials", [])
-    if not trials:
+    if not trials or not isinstance(trials, list):
         return jsonify({"error": "trials list is required"}), 400
+    if not all(isinstance(t, str) for t in trials):
+        return jsonify({"error": "trials must be a list of strings"}), 400
 
     try:
         datetime.strptime(date, "%Y-%m-%d")
     except ValueError:
         return jsonify({"error": "Invalid date format, expected YYYY-MM-DD"}), 400
 
+    json_path = g.api_json_diary_path
+    if not json_path:
+        return jsonify({"error": "json_diary_path not configured"}), 500
+
     try:
-        from lingodiary.diary_json import load_diary_json, save_diary_json, get_day
-
-        json_path = _g.api_json_diary_path
-        if not json_path:
-            return jsonify({"error": "json_diary_path not configured"}), 500
-
-        date_slash = date.replace("-", "/")
-        diary_json = load_diary_json(json_path)
-        day = get_day(diary_json, date_slash)
-        if day is None:
-            return jsonify({"error": f"No diary entry for {date}"}), 404
-
-        for i, trial in enumerate(trials):
-            if i < len(day.entries):
-                day.entries[i].user_trial_translation = trial
-        save_diary_json(diary_json, json_path)
+        with diary_lock(json_path):
+            diary_json = load_diary_json(json_path)
+            day = get_day(diary_json, date.replace("-", "/"))
+            if day is None:
+                return jsonify({"error": f"No diary entry for {date}"}), 404
+            for entry, trial in zip(day.entries, trials):
+                entry.user_trial_translation = trial
+            save_diary_json(diary_json, json_path)
     except Exception as exc:
         app.logger.error(f"api_save_trials error: {exc}")
         return jsonify({"error": str(exc)}), 500
@@ -1222,16 +1301,16 @@ def api_save_trials(date):
 @_jwt_required
 def api_get_config():
     """Return user config values relevant to the mobile app."""
-    from flask import g as _g
-    import yaml as _yaml
 
-    config_path = _g.api_config_path
+    config_path = g.api_config_path
     try:
         with open(config_path, encoding="utf-8") as _cf:
-            cfg = _yaml.safe_load(_cf)
+            cfg = yaml.safe_load(_cf)
     except Exception:
         cfg = {}
 
+    cfg = cfg or {}
+    kw = cfg.get("tprs_keywords") or {}
     tts_cfg = cfg.get("tts", {})
     drive_mode_available = bool(
         tts_cfg.get("piper_input_language", {}).get("voice", "")
@@ -1241,9 +1320,9 @@ def api_get_config():
     return jsonify(
         {
             "tprs": {
-                "sentence": "SETNING:",
-                "question": "SPØRSMÅL:",
-                "answer": "SVAR:",
+                "sentence": kw.get("sentence", "SETNING:"),
+                "question": kw.get("question", "SPØRSMÅL:"),
+                "answer": kw.get("answer", "SVAR:"),
             },
             "drive_mode_available": drive_mode_available,
             "pause_between_sentences_duration": pause_ms,
@@ -1255,14 +1334,13 @@ def api_get_config():
 @_jwt_required
 def api_get_lesson_last_reviewed(date):
     """Get the last_reviewed timestamp for a specific lesson date."""
-    from flask import g as _g
     from lingodiary.diary_json import load_diary_json, get_day
 
     # Normalize date to YYYY/MM/DD
     date_slash = date.replace("-", "/")
 
     try:
-        diary = load_diary_json(_g.api_json_diary_path)
+        diary = load_diary_json(g.api_json_diary_path)
         day = get_day(diary, date_slash)
         if day is None:
             return jsonify({"error": "Lesson not found"}), 404
@@ -1276,32 +1354,38 @@ def api_get_lesson_last_reviewed(date):
 @_jwt_required
 def api_update_lesson_last_reviewed(date):
     """Update the last_reviewed timestamp for a specific lesson date."""
-    from flask import g as _g
-    from lingodiary.diary_json import load_diary_json, save_diary_json, get_day
-    from datetime import datetime, timezone
+    from lingodiary.diary_json import (
+        diary_lock,
+        get_day,
+        load_diary_json,
+        save_diary_json,
+    )
 
-    # Normalize date to YYYY/MM/DD
     date_slash = date.replace("-", "/")
-
     data = request.get_json(silent=True) or {}
-    timestamp = data.get("timestamp")
 
-    # If no timestamp provided, use current time
-    if not timestamp:
-        timestamp = datetime.now(timezone.utc).isoformat()
+    if data.get("timestamp"):
+        parsed = _parse_iso_utc(data["timestamp"])
+        if parsed is None:
+            return jsonify({"error": "timestamp must be an ISO-8601 string"}), 400
+    else:
+        parsed = datetime.now(timezone.utc)
+    # Normalised to UTC so string sorting of last_reviewed is chronological.
+    timestamp = parsed.isoformat()
 
     try:
-        diary = load_diary_json(_g.api_json_diary_path)
-        day = get_day(diary, date_slash)
-        if day is None:
-            return jsonify({"error": "Lesson not found"}), 404
+        with diary_lock(g.api_json_diary_path):
+            diary = load_diary_json(g.api_json_diary_path)
+            day = get_day(diary, date_slash)
+            if day is None:
+                return jsonify({"error": "Lesson not found"}), 404
+            # Keep the newest value if an older offline replay arrives late.
+            if not day.last_reviewed or timestamp > day.last_reviewed:
+                day.last_reviewed = timestamp
+            save_diary_json(diary, g.api_json_diary_path)
+            current = day.last_reviewed
 
-        day.last_reviewed = timestamp
-        save_diary_json(diary, _g.api_json_diary_path)
-
-        return jsonify(
-            {"date": date_slash, "last_reviewed": day.last_reviewed, "success": True}
-        )
+        return jsonify({"date": date_slash, "last_reviewed": current, "success": True})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
@@ -1310,13 +1394,12 @@ def api_update_lesson_last_reviewed(date):
 @_jwt_required
 def api_recently_studied_lessons():
     """Get the 10 most recently studied lessons (by last_reviewed timestamp)."""
-    from flask import g as _g
     from lingodiary.diary_json import load_diary_json
 
-    limit = int(request.args.get("limit", 10))
+    limit = _int_arg("limit", 10, 1, 200)
 
     try:
-        diary = load_diary_json(_g.api_json_diary_path)
+        diary = load_diary_json(g.api_json_diary_path)
 
         # Filter days that have been reviewed and sort by last_reviewed desc
         reviewed_days = [day for day in diary.diaries if day.last_reviewed is not None]
@@ -1342,7 +1425,9 @@ def api_recently_studied_lessons():
 
 
 def main():
-    app.run(debug=True, use_reloader=False, host="0.0.0.0", port=8084)
+    # The Werkzeug debugger allows remote code execution: opt-in only (FLASK_DEBUG=1).
+    debug = os.getenv("FLASK_DEBUG", "").lower() in ("1", "true", "yes")
+    app.run(debug=debug, use_reloader=False, host="0.0.0.0", port=8084)
 
 
 if __name__ == "__main__":
