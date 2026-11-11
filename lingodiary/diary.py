@@ -68,11 +68,9 @@ import json
 import logging
 import os
 import time
-from collections import defaultdict
 from datetime import datetime
 from functools import cached_property
 from pathlib import Path
-from typing import Callable
 
 import yaml
 from openai import OpenAI
@@ -181,38 +179,40 @@ class DiaryHandler:
         Configures a logger with both file and stream handlers if not already set up.
         Logs are written to 'output.log' in the configured output directory.
         """
-        # Check if logger is already set up to avoid duplicate handlers
         logger = logging.getLogger(__name__)
+        log_path = os.path.abspath(os.path.join(self.output_dir, "output.log"))
 
-        if not any(
-            isinstance(handler, logging.FileHandler) for handler in logger.handlers
-        ):
+        # The logger is process-global but each user has their own output.log:
+        # drop file handlers that point at another user's log before attaching ours.
+        has_ours = False
+        for handler in logger.handlers[:]:
+            if isinstance(handler, logging.FileHandler):
+                if handler.baseFilename == log_path:
+                    has_ours = True
+                else:
+                    handler.close()
+                    logger.removeHandler(handler)
+
+        if not has_ours:
             log_formatter = logging.Formatter(
                 "%(asctime)s - %(levelname)s - %(message)s"
             )
 
-            # Create file handler to log into output.log (flush after every record)
             class FlushingFileHandler(logging.FileHandler):
                 def emit(self, record):
                     super().emit(record)
                     self.flush()
 
             os.makedirs(self.output_dir, exist_ok=True)
-            file_handler = FlushingFileHandler(
-                os.path.join(self.config["output_dir"], "output.log")
-            )
+            file_handler = FlushingFileHandler(log_path)
             file_handler.setFormatter(log_formatter)
-
-            # Create stream handler for console output
-            stream_handler = logging.StreamHandler()
-            stream_handler.setFormatter(log_formatter)
-
-            # Set logger level to INFO
-            logger.setLevel(
-                logging.INFO
-            )  # You can change this to DEBUG for more verbosity
+            logger.setLevel(logging.INFO)
             logger.addHandler(file_handler)
-            logger.addHandler(stream_handler)
+
+            if not any(type(h) is logging.StreamHandler for h in logger.handlers):
+                stream_handler = logging.StreamHandler()
+                stream_handler.setFormatter(log_formatter)
+                logger.addHandler(stream_handler)
 
         self.logging = logger
 
@@ -391,7 +391,7 @@ class DiaryHandler:
                   "study_language_sentence_trial".
         """
         prompt = f"""
-        You need to translate a sentence given in {self.config["languages"]["primary_language"]} into {self.config["languages"]["study_language"]}].
+        You need to translate a sentence given in {self.config["languages"]["primary_language"]} into {self.config["languages"]["study_language"]}.
         The output should be a JSON dictionary where:
         - The main key is "sentence".
         - Under "sentence" is another dictionnary with 3 keys:
@@ -516,7 +516,7 @@ class DiaryHandler:
 
                 diary_json = upsert_day(diary_json, date_str, title, entries)
 
-            save_diary_json(diary_json, json_path)
+            save_diary_json(diary_json, json_path, preserve_user_state=True)
             self.logging.info(f"JSON diary updated at {json_path}")
         except Exception as exc:
             self.logging.warning(f"Could not write JSON diary: {exc}")
@@ -557,7 +557,14 @@ class DiaryHandler:
 
             self.titles_dict[date_obj] = day.title or ""
             sentences = {}
-            for i, entry in enumerate(day.entries):
+            for pos, entry in enumerate(day.entries):
+                # Key by the stored index so writing back never renumbers
+                # entries (that would misalign SRS state and variants).
+                i = entry.index if entry.index not in sentences else None
+                if i is None:
+                    i = max(sentences, default=-1) + 1
+                    while i in sentences:
+                        i += 1
                 sentences[i] = {
                     "primary_language_sentence": entry.input_language_sentence or "",
                     "study_language_sentence": entry.output_language_translation or "",
@@ -813,6 +820,9 @@ class TprsVariantHandler:
                                 question=qa_raw[k]["question"],
                                 answer=qa_raw[k]["answer"],
                                 # Preserve already-populated fields — never blank them out
+                                generated_at=(
+                                    existing.generated_at if existing else None
+                                ),
                                 question_input=(
                                     existing.question_input
                                     if existing and existing.question_input
@@ -896,7 +906,7 @@ class TprsVariantHandler:
                         ),
                     )
 
-            save_diary_json(diary_json, json_path)
+            save_diary_json(diary_json, json_path, preserve_user_state=True)
             self.logging.info(
                 f"JSON diary updated with {self.variant_name} TPRS data at {json_path}"
             )
@@ -1005,17 +1015,11 @@ class TprsVariantHandler:
                     continue
 
                 # Determine if this sentence needs processing for this variant
-                needs_processing = False
-                if self.variant_name == "Standard":
-                    if diary_sentence_text not in current_day_variant_content:
-                        needs_processing = True
-                else:  # For 'Enhanced', 'Future', 'Present'
-                    # Check at the sentence level: a sentence is missing if the base
-                    # Standard TPRS sentence is not yet present in this variant's content
-                    # for this date. This handles both brand-new dates AND new sentences
-                    # added to an existing date.
-                    if diary_sentence_text not in current_day_variant_content:
-                        needs_processing = True
+                # Sentence-level check: handles brand-new dates AND new sentences
+                # added to an existing date, for every variant.
+                needs_processing = (
+                    diary_sentence_text not in current_day_variant_content
+                )
 
                 if needs_processing:
                     self.logging.info(
@@ -1101,7 +1105,7 @@ class TprsVariantHandler:
                         f"Cleared stale {self.variant_name} audio path for {date_str} — will regenerate."
                     )
             if changed:
-                save_diary_json(diary_db, json_path)
+                save_diary_json(diary_db, json_path, preserve_user_state=True)
         except Exception as exc:
             self.logging.warning(
                 f"Could not clear {self.variant_name} audio paths: {exc}"
@@ -1153,7 +1157,7 @@ class PresentTprsVariantHandler(TprsVariantHandler):
 
 
 class TprsCreation(DiaryHandler):
-    def __init__(self, config_path=None):
+    def __init__(self, config_path=None, generate_missing=True):
         """Initializes the TprsCreation class, inheriting from DiaryHandler.
 
         Sets up TPRS variant handlers, ensures initial markdown files are created
@@ -1162,6 +1166,9 @@ class TprsCreation(DiaryHandler):
         Args:
             config_path (str, optional): Path to the configuration file.
                                          Defaults to None.
+            generate_missing (bool): When False the constructor has no side
+                effects (no OpenAI calls, no diary.json writes).  Use this when
+                only a helper such as ``backfill_qa_translations`` is needed.
         """
         super().__init__(config_path)
 
@@ -1171,6 +1178,12 @@ class TprsCreation(DiaryHandler):
             FutureTprsVariantHandler(self),
             PresentTprsVariantHandler(self),
         ]
+
+        if not generate_missing:
+            os.makedirs(os.path.join(self.output_dir, "TPRS"), exist_ok=True)
+            self.get_all_tprs_titles()
+            self.get_all_diary_titles()
+            return
 
         # Load diary data from JSON
         diary_dict = self.json_diary_to_dict()
@@ -1199,11 +1212,8 @@ class TprsCreation(DiaryHandler):
             )
 
         # --- Other Variants Handling ---
-        for variant in self.variants:
-            if variant.variant_name == "Standard":
-                variant.create_initial_if_needed(diary_dict)
-            else:
-                variant.create_initial_if_needed(diary_dict, base_tprs_dict)
+        for variant in self.variants[1:]:
+            variant.create_initial_if_needed(diary_dict, base_tprs_dict)
 
         # Ensure TPRS output directory exists (for audio files)
         os.makedirs(os.path.join(self.output_dir, "TPRS"), exist_ok=True)
@@ -1240,7 +1250,7 @@ class TprsCreation(DiaryHandler):
             day = get_day(diary_db, date_str)
             if day:
                 day.lesson_audio_paths.clear()
-                save_diary_json(diary_db, json_path)
+                save_diary_json(diary_db, json_path, preserve_user_state=True)
                 self.logging.info(
                     f"Cleared lesson_audio_paths for {date_str} — audio will be regenerated."
                 )
@@ -1742,7 +1752,7 @@ class TprsCreation(DiaryHandler):
                         )
 
             if day_changed:
-                save_diary_json(db, json_path)
+                save_diary_json(db, json_path, preserve_user_state=True)
                 changed = True
                 total_translated += day_translated
                 self.logging.info(
@@ -1822,7 +1832,7 @@ class TprsCreation(DiaryHandler):
                         )
 
             if day_changed:
-                save_diary_json(db, json_path)
+                save_diary_json(db, json_path, preserve_user_state=True)
                 changed = True
                 total_translated += day_translated
                 self.logging.info(
@@ -1901,9 +1911,9 @@ class TprsCreation(DiaryHandler):
                         qa_dict_for_sentence = standard_variant.get_openai_generator()(
                             study_lang_sentence
                         )
-                        current_day_tprs_sentences_data[
-                            study_lang_sentence
-                        ] = qa_dict_for_sentence
+                        current_day_tprs_sentences_data[study_lang_sentence] = (
+                            qa_dict_for_sentence
+                        )
                         self.logging.info(
                             f"Standard TPRS: Generated Q&A for '{study_lang_sentence[:60]}...' on {current_date_key}."
                         )

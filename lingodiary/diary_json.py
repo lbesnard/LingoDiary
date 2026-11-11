@@ -2,7 +2,9 @@
 diary_json.py — JSON schema, serialisation helpers, and SM-2 SRS algorithm
 for the LingoAnki diary database.
 
-Schema (schema_version 1.2.0):
+Schema (schema_version 1.3.0).  Entry ``index`` values are whatever was stored
+(the generation pipeline historically used 0-based, the API 1-based); code must
+never assume a base and should match entries by ``index`` as stored:
 {
   "schema_version": "1.2.0",
   "diaries": [
@@ -15,7 +17,7 @@ Schema (schema_version 1.2.0):
       },
       "entries": [
         {
-          "index": 0,
+          "index": 1,
           "input_language_sentence": "...",
           "user_trial_translation": "...",
           "output_language_translation": "...",
@@ -59,6 +61,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -83,7 +87,9 @@ class AudioTiming:
     def from_dict(cls, d: dict) -> "AudioTiming":
         if not isinstance(d, dict):
             return cls()
-        return cls(start_ms=int(d.get("start_ms", 0)), end_ms=int(d.get("end_ms", 0)))
+        return cls(
+            start_ms=int(d.get("start_ms") or 0), end_ms=int(d.get("end_ms") or 0)
+        )
 
 
 @dataclass
@@ -100,9 +106,9 @@ class QA:
     answer_audio_path: str = ""  # relative to output_dir
     question_input_language_audio_path: str = ""  # Input Language TTS for Drive Mode
     answer_input_language_audio_path: str = ""  # Input Language TTS for Drive Mode
-    generated_at: Optional[
-        str
-    ] = None  # ISO-8601 UTC — when this Q&A's audio segments were generated
+    generated_at: Optional[str] = (
+        None  # ISO-8601 UTC — when this Q&A's audio segments were generated
+    )
 
     def to_dict(self) -> dict:
         return {
@@ -151,9 +157,9 @@ class SentenceBlock:
     sentence_audio_path: str = (
         ""  # relative to output_dir, e.g. "TPRS/SEGMENTS/2025-12-14_original/0_s.mp3"
     )
-    sentence_audio_generated_at: Optional[
-        str
-    ] = None  # ISO-8601 UTC — when this sentence's audio segment was generated
+    sentence_audio_generated_at: Optional[str] = (
+        None  # ISO-8601 UTC — when this sentence's audio segment was generated
+    )
     sentence_input_language_audio_path: str = ""  # Input Language TTS for Drive Mode
 
     def to_dict(self) -> dict:
@@ -175,7 +181,7 @@ class SentenceBlock:
             sentence=d.get("sentence", ""),
             sentence_input=d.get("sentence_input", ""),
             audio_timing=AudioTiming.from_dict(d.get("audio_timing", {})),
-            qa=[QA.from_dict(q) for q in d.get("qa", [])],
+            qa=[QA.from_dict(q) for q in (d.get("qa") or [])],
             sentence_audio_path=d.get("sentence_audio_path", ""),
             sentence_audio_generated_at=d.get("sentence_audio_generated_at"),
             sentence_input_language_audio_path=d.get(
@@ -247,7 +253,9 @@ class VariantSet:
         )
 
     def get_variant(self, name: str) -> SentenceBlock:
-        return getattr(self, name, SentenceBlock())
+        if name not in VARIANTS:
+            return SentenceBlock()
+        return getattr(self, name)
 
     def set_variant(self, name: str, variant: SentenceBlock) -> None:
         if name in VARIANTS:
@@ -355,23 +363,103 @@ def load_diary_json(path: str | Path) -> DiaryJson:
         return DiaryJson.from_dict(json.load(f))
 
 
-def save_diary_json(diary: DiaryJson, path: str | Path) -> None:
-    """Atomically write diary JSON to disk (write-to-tmp then rename)."""
+_LOCKS: dict[str, threading.RLock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def diary_lock(path: str | Path):
+    """Process-wide re-entrant lock for one diary.json.
+
+    Hold it around any load -> modify -> save sequence so concurrent API
+    requests and the background worker cannot overwrite each other.
+    """
+    key = os.path.realpath(str(path))
+    with _LOCKS_GUARD:
+        lock = _LOCKS.setdefault(key, threading.RLock())
+    with lock:
+        yield
+
+
+def _merge_user_state(diary: DiaryJson, on_disk: DiaryJson) -> None:
+    """Copy fields mutated by API requests (SRS state, last_reviewed, trials)
+    from the freshly loaded on-disk diary into *diary*.
+
+    Long-running background jobs hold an in-memory copy for minutes; without
+    this, saving it would silently revert anything the user did meanwhile.
+    """
+    disk_days = {d.date: d for d in on_disk.diaries}
+    mem_dates = {d.date for d in diary.diaries}
+    # Days created via the API while the job was running: keep them.
+    for disk_day in on_disk.diaries:
+        if disk_day.date not in mem_dates:
+            diary.diaries.append(disk_day)
+    for day in diary.diaries:
+        disk_day = disk_days.get(day.date)
+        if disk_day is None or disk_day is day:
+            continue
+        # Sentences appended via the API while the job was running: keep them.
+        mem_indexes = {e.index for e in day.entries}
+        mem_texts = {e.input_language_sentence for e in day.entries}
+        added = [
+            e
+            for e in disk_day.entries
+            if e.index not in mem_indexes
+            and e.input_language_sentence not in mem_texts
+        ]
+        if added:
+            day.entries.extend(added)
+            day.entries.sort(key=lambda e: e.index)
+        if disk_day.last_reviewed:
+            day.last_reviewed = disk_day.last_reviewed
+        disk_entries = {e.index: e for e in disk_day.entries}
+        for entry in day.entries:
+            disk_entry = disk_entries.get(entry.index)
+            if disk_entry is None:
+                continue
+            if (
+                disk_entry.input_language_sentence
+                and disk_entry.input_language_sentence != entry.input_language_sentence
+            ):
+                continue  # different sentence now lives at this index
+            entry.lessons.reviewing = disk_entry.lessons.reviewing
+            if disk_entry.user_trial_translation:
+                entry.user_trial_translation = disk_entry.user_trial_translation
+
+
+def save_diary_json(
+    diary: DiaryJson, path: str | Path, preserve_user_state: bool = False
+) -> None:
+    """Atomically write diary JSON to disk (write-to-tmp then rename).
+
+    Pass ``preserve_user_state=True`` from background jobs that work on a
+    long-lived in-memory copy: SRS state, ``last_reviewed`` and translation
+    attempts are re-read from disk under the lock and kept.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # ── Atomic write ──────────────────────────────────────────────────────────
-    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(diary.to_dict(), f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, path)
-    except Exception:
+    with diary_lock(path):
+        if preserve_user_state and path.exists() and path.stat().st_size > 0:
+            try:
+                _merge_user_state(diary, load_diary_json(path))
+            except (OSError, ValueError):
+                pass
+
+        # ── Atomic write ──────────────────────────────────────────────────────
+        fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
         try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(diary.to_dict(), f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
 
 # ── Query helpers ──────────────────────────────────────────────────────────────
@@ -401,43 +489,41 @@ def upsert_day(
 ) -> DiaryJson:
     """Insert or update the DiaryDay for the given date.
 
-    If the day exists, we mutate it in-place to preserve all existing metadata
-    (like last_reviewed, timestamps, etc.) while carefully merging nested entry data.
+    If the day exists it is mutated in place.  Entries are matched by ``index``;
+    for a match whose sentence text is unchanged, SRS state and variants are
+    preserved, and text fields left empty in the new entry (translation, tips,
+    trial) keep their old values.  Existing entries that are absent from
+    *entries* are kept — this function never deletes sentences.
     """
-    # 1. Check if the day already exists in the dictionary
     existing_day = get_day(diary, date_str)
 
-    if existing_day:
-        # Update the title (if a new one was provided)
-        if title:
-            existing_day.title = title
-
-        # Merge new entries with old entries to preserve SRS state and variants
-        for new_entry in entries:
-            # Find the corresponding old entry by index
-            old_entry = next(
-                (e for e in existing_day.entries if e.index == new_entry.index), None
-            )
-
-            if old_entry:
-                # Preserve SRS state
-                new_entry.lessons.reviewing = old_entry.lessons.reviewing
-
-                # Preserve variant Q&A already written
-                for variant_name in ("original", "enhanced", "present", "future"):
-                    old_variant = old_entry.lessons.get_variant(variant_name)
-                    if old_variant:
-                        new_entry.lessons.set_variant(variant_name, old_variant)
-
-        # Overwrite the old entries list with the freshly merged one
-        existing_day.entries = entries
-
-    else:
-        # 2. If it doesn't exist, append a brand new day and sort
-        new_day = DiaryDay(date=date_str, title=title, entries=entries)
-        diary.diaries.append(new_day)
+    if existing_day is None:
+        diary.diaries.append(DiaryDay(date=date_str, title=title, entries=entries))
         diary.diaries.sort(key=lambda d: d.date, reverse=True)
+        return diary
 
+    if title:
+        existing_day.title = title
+
+    old_by_index = {e.index: e for e in existing_day.entries}
+    merged: dict[int, Sentence] = dict(old_by_index)
+    for new_entry in entries:
+        old = old_by_index.get(new_entry.index)
+        if old is not None and (
+            old.input_language_sentence.strip()
+            == new_entry.input_language_sentence.strip()
+        ):
+            new_entry.lessons = old.lessons
+            for attr in (
+                "output_language_translation",
+                "tips",
+                "user_trial_translation",
+            ):
+                if not getattr(new_entry, attr):
+                    setattr(new_entry, attr, getattr(old, attr))
+        merged[new_entry.index] = new_entry
+
+    existing_day.entries = [merged[i] for i in sorted(merged)]
     return diary
 
 
@@ -458,7 +544,9 @@ def upsert_variant(
 # ── SM-2 SRS algorithm ─────────────────────────────────────────────────────────
 
 
-def apply_sm2(reviewing: ReviewingState, score: int) -> ReviewingState:
+def apply_sm2(
+    reviewing: ReviewingState, score: int, now: Optional[datetime] = None
+) -> ReviewingState:
     """
     Apply a simplified SM-2 update to a ReviewingState.
 
@@ -471,7 +559,7 @@ def apply_sm2(reviewing: ReviewingState, score: int) -> ReviewingState:
 
     Returns the mutated ReviewingState (same object).
     """
-    now_utc = datetime.now(timezone.utc)
+    now_utc = now or datetime.now(timezone.utc)
     reviewing.review_count += 1
     reviewing.last_reviewed = now_utc.isoformat()
     reviewing.mastery_score = score
@@ -502,7 +590,11 @@ def apply_sm2(reviewing: ReviewingState, score: int) -> ReviewingState:
 
 
 def update_srs(
-    diary: DiaryJson, date_str: str, entry_index: int, score: int
+    diary: DiaryJson,
+    date_str: str,
+    entry_index: int,
+    score: int,
+    now: Optional[datetime] = None,
 ) -> tuple[DiaryJson, ReviewingState]:
     """
     Apply SM-2 to the reviewing state of a specific entry.
@@ -513,7 +605,7 @@ def update_srs(
     entry = get_entry(diary, date_str, entry_index)
     if entry is None:
         raise ValueError(f"No entry found for date={date_str} index={entry_index}")
-    apply_sm2(entry.lessons.reviewing, score)
+    apply_sm2(entry.lessons.reviewing, score, now=now)
     return diary, entry.lessons.reviewing
 
 
@@ -563,6 +655,10 @@ def get_due_entries(diary: DiaryJson) -> list[tuple[DiaryDay, Sentence]]:
                 except ValueError:
                     pass
 
+    def _due_key(pair: tuple[DiaryDay, Sentence]) -> str:
+        return pair[1].lessons.reviewing.next_review or ""
+
+    overdue.sort(key=_due_key)  # most overdue first
     return overdue + new_entries
 
 

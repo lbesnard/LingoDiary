@@ -26,7 +26,6 @@ from lingodiary.diary_json import (
     upsert_day,
 )
 
-
 # ── Fixtures ───────────────────────────────────────────────────────────────────
 
 
@@ -251,3 +250,137 @@ class TestSaveDiaryJson:
         assert r2.status == "mastered"
         assert r2.interval_days == 14
         assert r2.review_count == 3
+
+
+# ── upsert_day / locking / user-state preservation ─────────────────────────────
+
+
+def _day_with(entries):
+    from lingodiary.diary_json import DiaryDay, DiaryJson
+
+    return DiaryJson(diaries=[DiaryDay(date="2026/01/01", entries=entries)])
+
+
+class TestUpsertDayNonDestructive:
+    def test_entries_absent_from_new_list_are_kept(self):
+        from lingodiary.diary_json import Sentence, upsert_day
+
+        diary = _day_with(
+            [
+                Sentence(index=1, input_language_sentence="a"),
+                Sentence(index=2, input_language_sentence="b"),
+                Sentence(index=3, input_language_sentence="c"),
+            ]
+        )
+        upsert_day(
+            diary, "2026/01/01", "", [Sentence(index=4, input_language_sentence="d")]
+        )
+        assert [e.index for e in diary.diaries[0].entries] == [1, 2, 3, 4]
+
+    def test_same_sentence_keeps_srs_and_translation(self):
+        from lingodiary.diary_json import Sentence, upsert_day
+
+        old = Sentence(
+            index=1,
+            input_language_sentence="a",
+            output_language_translation="A!",
+            tips="t",
+        )
+        old.lessons.reviewing.review_count = 7
+        diary = _day_with([old])
+        upsert_day(
+            diary, "2026/01/01", "", [Sentence(index=1, input_language_sentence="a")]
+        )
+        e = diary.diaries[0].entries[0]
+        assert e.lessons.reviewing.review_count == 7
+        assert e.output_language_translation == "A!"
+        assert e.tips == "t"
+
+    def test_changed_sentence_does_not_inherit_old_variants(self):
+        from lingodiary.diary_json import Sentence, upsert_day
+
+        old = Sentence(index=1, input_language_sentence="a")
+        old.lessons.original.sentence = "stale"
+        old.lessons.reviewing.review_count = 7
+        diary = _day_with([old])
+        upsert_day(
+            diary,
+            "2026/01/01",
+            "",
+            [Sentence(index=1, input_language_sentence="DIFFERENT")],
+        )
+        e = diary.diaries[0].entries[0]
+        assert e.lessons.original.sentence == ""
+        assert e.lessons.reviewing.review_count == 0
+
+
+class TestSavePreservesUserState:
+    def test_background_save_does_not_revert_a_score(self, tmp_path):
+        from lingodiary.diary_json import (
+            Sentence,
+            load_diary_json,
+            save_diary_json,
+            update_srs,
+        )
+
+        path = tmp_path / "diary.json"
+        save_diary_json(
+            _day_with([Sentence(index=1, input_language_sentence="a")]), path
+        )
+
+        stale = load_diary_json(path)  # background job's long-lived copy
+
+        fresh = load_diary_json(path)  # user scores meanwhile
+        update_srs(fresh, "2026/01/01", 1, 3)
+        save_diary_json(fresh, path)
+
+        stale.diaries[0].entries[0].tips = "new tip"
+        save_diary_json(stale, path, preserve_user_state=True)
+
+        final = load_diary_json(path).diaries[0].entries[0]
+        assert final.lessons.reviewing.review_count == 1
+        assert final.tips == "new tip"
+
+    def test_background_save_keeps_sentence_added_meanwhile(self, tmp_path):
+        from lingodiary.diary_json import (
+            Sentence,
+            load_diary_json,
+            save_diary_json,
+        )
+
+        path = tmp_path / "diary.json"
+        save_diary_json(
+            _day_with([Sentence(index=1, input_language_sentence="a")]), path
+        )
+        stale = load_diary_json(path)
+
+        fresh = load_diary_json(path)  # user appends a sentence meanwhile
+        fresh.diaries[0].entries.append(
+            Sentence(index=2, input_language_sentence="b")
+        )
+        save_diary_json(fresh, path)
+
+        save_diary_json(stale, path, preserve_user_state=True)
+        texts = [
+            e.input_language_sentence
+            for e in load_diary_json(path).diaries[0].entries
+        ]
+        assert texts == ["a", "b"]
+
+    def test_score_replay_uses_supplied_time(self):
+        from datetime import datetime, timezone
+
+        from lingodiary.diary_json import ReviewingState, apply_sm2
+
+        when = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+        r = apply_sm2(ReviewingState(), 3, now=when)
+        assert r.last_reviewed.startswith("2026-01-01T12:00")
+        assert r.next_review.startswith("2026-01-04T12:00")
+
+
+class TestGetVariantGuard:
+    def test_non_variant_attribute_names_are_not_exposed(self):
+        from lingodiary.diary_json import VariantSet
+
+        assert VariantSet().get_variant("reviewing").sentence == ""
+        assert VariantSet().get_variant("to_dict").sentence == ""
