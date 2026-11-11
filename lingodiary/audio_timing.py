@@ -50,6 +50,54 @@ _KEY_TO_SUFFIX = {
 }
 
 
+class SegmentGenerationError(RuntimeError):
+    """TTS produced no audio for a non-empty text."""
+
+
+_MANIFEST_NAME = "segments.json"
+
+
+def _text_hash(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _load_manifest(segs_dir: str) -> dict:
+    import json
+
+    try:
+        with open(os.path.join(segs_dir, _MANIFEST_NAME), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_manifest(segs_dir: str, manifest: dict) -> None:
+    import json
+
+    os.makedirs(segs_dir, exist_ok=True)
+    tmp = os.path.join(segs_dir, _MANIFEST_NAME + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(manifest, f)
+    os.replace(tmp, os.path.join(segs_dir, _MANIFEST_NAME))
+
+
+def _expected_segment_texts(entries: list, variant_key: str) -> dict[str, str]:
+    """Map segment filename -> the text it should contain."""
+    out: dict[str, str] = {}
+    for idx, entry in enumerate(entries):
+        variant = entry.lessons.get_variant(variant_key)
+        if not variant.sentence:
+            continue
+        out[f"{idx}_s.mp3"] = variant.sentence
+        for j, qa in enumerate(variant.qa):
+            out[f"{idx}_q{j}.mp3"] = qa.question
+            out[f"{idx}_a{j}.mp3"] = qa.answer
+    return out
+
+
 def _generate_segment(
     text: str,
     out_path: str,
@@ -120,18 +168,19 @@ def _segments_dir(output_dir: str, date_str: str, variant_key: str) -> str:
 
 
 def _segments_complete(segs_dir: str, entries: list, variant_key: str) -> bool:
-    """Return True if all expected MP3 segment files already exist."""
-    for idx, entry in enumerate(entries):
-        variant = entry.lessons.get_variant(variant_key)
-        if not variant.sentence:
-            continue
-        if not os.path.exists(os.path.join(segs_dir, f"{idx}_s.mp3")):
+    """Return True if all expected MP3 segments exist and still match the text.
+
+    Segments generated before the manifest existed are trusted (no hash to
+    compare); anything generated afterwards is invalidated when its text changes.
+    """
+    manifest = _load_manifest(segs_dir)
+    for fname, text in _expected_segment_texts(entries, variant_key).items():
+        if not os.path.exists(os.path.join(segs_dir, fname)):
             return False
-        for j in range(len(variant.qa)):
-            if not os.path.exists(os.path.join(segs_dir, f"{idx}_q{j}.mp3")):
-                return False
-            if not os.path.exists(os.path.join(segs_dir, f"{idx}_a{j}.mp3")):
-                return False
+        recorded = manifest.get(fname)
+        if recorded is not None and recorded != _text_hash(text):
+            logger.info(f"  {fname}: text changed since generation — regenerating.")
+            return False
     return True
 
 
@@ -240,6 +289,14 @@ def _compute_day_timings(
     cumulative = 0
     timings: list[tuple[int, int]] = []
     has_any = False
+    manifest: dict = {}
+
+    def _gen(text: str, path: str) -> int:
+        dur = _generate_segment(text, path, tts_plugin, lang, voice)
+        if dur <= 0 and text and text.strip():
+            raise SegmentGenerationError(f"TTS failed for {path}: {text[:60]!r}")
+        manifest[os.path.basename(path)] = _text_hash(text)
+        return dur
 
     for idx, entry in enumerate(entries):
         variant = entry.lessons.get_variant(variant_key)
@@ -252,7 +309,7 @@ def _compute_day_timings(
         # -- Sentence ------------------------------------------------------
         entry_start = cumulative
         s_path = os.path.join(segs_dir, f"{idx}_s.mp3")
-        s_dur = _generate_segment(variant.sentence, s_path, tts_plugin, lang, voice)
+        s_dur = _gen(variant.sentence, s_path)
         entry_end = round(entry_start + s_dur * R)
         timings.append((round(entry_start), entry_end))
         variant.sentence_audio_path = os.path.relpath(s_path, output_dir)
@@ -267,7 +324,7 @@ def _compute_day_timings(
 
             q_path = os.path.join(segs_dir, f"{idx}_q{j}.mp3")
             q_start = round(cumulative)
-            q_dur = _generate_segment(qa.question, q_path, tts_plugin, lang, voice)
+            q_dur = _gen(qa.question, q_path)
             cumulative = round(cumulative + q_dur * R)
             qa.question_timing = AudioTiming(start_ms=q_start, end_ms=cumulative)
             qa.question_audio_path = os.path.relpath(q_path, output_dir)
@@ -276,7 +333,7 @@ def _compute_day_timings(
 
             a_path = os.path.join(segs_dir, f"{idx}_a{j}.mp3")
             a_start = round(cumulative)
-            a_dur = _generate_segment(qa.answer, a_path, tts_plugin, lang, voice)
+            a_dur = _gen(qa.answer, a_path)
             cumulative = round(cumulative + a_dur * R)
             qa.answer_timing = AudioTiming(start_ms=a_start, end_ms=cumulative)
             qa.answer_audio_path = os.path.relpath(a_path, output_dir)
@@ -288,6 +345,7 @@ def _compute_day_timings(
     if not has_any:
         return []
 
+    _save_manifest(segs_dir, manifest)
     return timings
 
 
@@ -621,24 +679,30 @@ def backfill_audio_timings(
     total_days = len(diary.diaries)
     logger.info(f"Processing {total_days} diary days...")
 
+    failed_days: list[str] = []
     try:
         for day_idx, day in enumerate(diary.diaries, 1):
             logger.info(f"Day {day_idx}/{total_days}: {day.date} -- {day.title}")
-            day_modified = _process_day_audio(
-                day=day,
-                variants=variants,
-                tts_plugin=tts_plugin,
-                lang=lang,
-                voice=voice,
-                repeat_tprs=repeat_tprs,
-                pause_ms=pause_ms,
-                answer_silence_ms=answer_silence_ms,
-                output_dir=output_dir,
-                tprs_dir=tprs_dir,
-                overwrite_existing=overwrite_existing,
-            )
+            try:
+                day_modified = _process_day_audio(
+                    day=day,
+                    variants=variants,
+                    tts_plugin=tts_plugin,
+                    lang=lang,
+                    voice=voice,
+                    repeat_tprs=repeat_tprs,
+                    pause_ms=pause_ms,
+                    answer_silence_ms=answer_silence_ms,
+                    output_dir=output_dir,
+                    tprs_dir=tprs_dir,
+                    overwrite_existing=overwrite_existing,
+                )
+            except Exception as exc:
+                logger.error(f"  Skipping {day.date}: {exc}")
+                failed_days.append(day.date)
+                continue
             if day_modified:
-                save_diary_json(diary, diary_json_path)
+                save_diary_json(diary, diary_json_path, preserve_user_state=True)
                 logger.info(f"  Saved progress for {day.date}.")
 
     finally:
@@ -647,6 +711,11 @@ def backfill_audio_timings(
         except Exception:
             pass
 
+    if failed_days:
+        logger.warning(
+            f"Audio timing backfill finished with errors on {len(failed_days)} "
+            f"day(s): {', '.join(failed_days)}"
+        )
     logger.info(f"Audio timing backfill complete: {diary_json_path}")
 
 
@@ -800,7 +869,7 @@ def backfill_drive_mode_audio(
                 output_dir=output_dir,
             )
             if day_modified:
-                save_diary_json(diary, diary_json_path)
+                save_diary_json(diary, diary_json_path, preserve_user_state=True)
                 logger.info(f"  Saved Drive Mode audio paths for {day.date}")
     finally:
         try:
@@ -810,6 +879,9 @@ def backfill_drive_mode_audio(
 
     logger.info("Drive Mode audio backfill complete.")
 
+
+def _setup_logging() -> None:
+    """Configure console logging for CLI use (never called by the web server)."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(message)s",

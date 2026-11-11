@@ -28,7 +28,6 @@ from lingodiary.diary_json import (
     VariantSet,
 )
 
-
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
@@ -336,3 +335,39 @@ class TestRecomputeTimingsFromSegments:
 
         assert result[0] == (0, s_dur)
         assert result[1] == (s_dur + pause_ms, s_dur + pause_ms + s_dur)
+
+
+# ── segment cache invalidation ─────────────────────────────────────────────────
+
+
+class TestSegmentCacheInvalidation:
+    def _entries(self, text):
+        from lingodiary.diary_json import Sentence
+
+        e = Sentence(index=1)
+        e.lessons.original.sentence = text
+        return [e]
+
+    def test_changed_text_invalidates_cached_segments(self, tmp_path):
+        from lingodiary import audio_timing as at
+
+        segs = tmp_path
+        (segs / "0_s.mp3").write_bytes(b"x")
+        at._save_manifest(str(segs), {"0_s.mp3": at._text_hash("old text")})
+        assert at._segments_complete(str(segs), self._entries("old text"), "original")
+        assert not at._segments_complete(
+            str(segs), self._entries("new text"), "original"
+        )
+
+    def test_legacy_segments_without_manifest_are_trusted(self, tmp_path):
+        from lingodiary import audio_timing as at
+
+        (tmp_path / "0_s.mp3").write_bytes(b"x")
+        assert at._segments_complete(
+            str(tmp_path), self._entries("anything"), "original"
+        )
+
+    def test_setup_logging_exists_for_cli(self):
+        from lingodiary import audio_timing as at
+
+        assert callable(at._setup_logging)
