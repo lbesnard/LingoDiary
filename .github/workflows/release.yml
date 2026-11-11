@@ -216,9 +216,8 @@ jobs:
           EOF
           echo "Created key.properties file with keystore path: $KEYSTORE_PATH"
 
-          # Verify key.properties was created correctly
-          echo "key.properties contents:"
-          cat android_app/android/key.properties
+          # Verify key.properties exists (never print it: it holds the passwords)
+          test -s android_app/android/key.properties
 
       - name: Install Flutter dependencies
         working-directory: android_app
