@@ -281,7 +281,7 @@ class LocalDbService {
 
   static Future<List<Map<String, dynamic>>> getUnsyncedScores() async {
     final database = await db;
-    return database.query('srs_scores', where: 'synced = 0');
+    return database.query('srs_scores', where: 'synced = 0', orderBy: 'id ASC');
   }
 
   static Future<void> markScoreSynced(int id) async {
@@ -296,13 +296,18 @@ class LocalDbService {
         where: 'id = ?', whereArgs: [id]);
   }
 
-  /// Deletes synced rows older than [days] from outbox tables.
+  /// Deletes old synced rows from outbox tables.
+  ///
+  /// `srs_scores` is intentionally NOT pruned: [getReviewStats] derives the
+  /// total, score distribution and streak from it.
   static Future<void> cleanupOldSyncedRows({int days = 90}) async {
     final database = await db;
-    await database.delete('srs_scores',
-        where: "synced = 1 AND scored_at < datetime('now', '-$days days')");
+    final cutoff =
+        DateTime.now().subtract(Duration(days: days)).toIso8601String();
     await database.delete('diary_cache',
-        where: "synced = 1 AND saved_at < datetime('now', '-$days days')");
+        where: 'synced = 1 AND saved_at < ?', whereArgs: [cutoff]);
+    await database.delete('pending_trials',
+        where: 'synced = 1');
   }
 
   /// Returns review statistics for the stats/streak screen.

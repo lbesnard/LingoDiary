@@ -20,7 +20,7 @@ class SyncService {
   static Future<String> localPath(String relPath) async {
     if (kIsWeb) {
       final base = await ApiService.baseUrl();
-      return '$base/api/sync/file/${Uri.encodeFull(relPath)}';
+      return '$base/api/sync/file/${ApiService.encodePath(relPath)}';
     }
     final dir = await _localOutputDir();
     return '${dir.path}/$relPath';
@@ -34,7 +34,7 @@ class SyncService {
     if (kIsWeb) {
       final base = await ApiService.baseUrl();
       final token = await AuthService.getToken() ?? '';
-      final encoded = Uri.encodeFull(relPath);
+      final encoded = ApiService.encodePath(relPath);
       return Uri.parse('$base/api/sync/file/$encoded?token=${Uri.encodeQueryComponent(token)}');
     }
     final path = await localPath(relPath);
@@ -114,7 +114,11 @@ class SyncService {
         final resp = await ApiService.downloadFile(relPath);
         if (resp.statusCode == 200) {
           await localFile.parent.create(recursive: true);
-          await localFile.writeAsBytes(resp.bodyBytes);
+          // Write to a temp file first so an interrupted download never
+          // leaves a truncated mp3 that looks "up to date" by mtime.
+          final tmp = File('${localFile.path}.part');
+          await tmp.writeAsBytes(resp.bodyBytes, flush: true);
+          await tmp.rename(localFile.path);
           downloaded++;
         }
       }

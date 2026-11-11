@@ -27,10 +27,18 @@ class _LoginScreenState extends State<LoginScreen> {
     if (!kIsWeb) _loadSavedServer();
   }
 
+  @override
+  void dispose() {
+    _serverController.dispose();
+    _usernameController.dispose();
+    _passwordController.dispose();
+    super.dispose();
+  }
+
   Future<void> _loadSavedServer() async {
     final prefs = await SharedPreferences.getInstance();
     final saved = prefs.getString('server_url');
-    if (saved != null) _serverController.text = saved;
+    if (saved != null && mounted) _serverController.text = saved;
   }
 
   Future<void> _login() async {

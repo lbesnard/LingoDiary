@@ -1,5 +1,5 @@
 import 'dart:convert';
-import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'auth_service.dart';
@@ -28,6 +28,32 @@ class ApiService {
   // Keep a private alias so existing internal callers are unchanged.
   static Future<String> _baseUrl() => baseUrl();
 
+  /// Percent-encodes each path segment (unlike [Uri.encodeFull], this also
+  /// escapes `?` and `#`, which can legitimately appear in lesson titles).
+  static String encodePath(String relPath) =>
+      relPath.split('/').map(Uri.encodeComponent).join('/');
+
+  static String _errorMessage(http.Response resp, String fallback) {
+    try {
+      final body = jsonDecode(resp.body);
+      if (body is Map && body['error'] is String) return body['error'] as String;
+    } catch (_) {
+      // Non-JSON error body (proxy page, etc.) — use the fallback.
+    }
+    return fallback;
+  }
+
+  /// Throws [ApiException] unless the response is 200.  A 401 also clears the
+  /// stored session so the app falls back to the login screen.
+  static Future<void> _expectOk(http.Response resp, String fallback) async {
+    if (resp.statusCode == 200) return;
+    if (resp.statusCode == 401) {
+      await AuthService.clearSession();
+      throw ApiException(401, 'Session expired. Please log in again.');
+    }
+    throw ApiException(resp.statusCode, _errorMessage(resp, fallback));
+  }
+
   static Future<Map<String, String>> _authHeaders() async {
     final token = await AuthService.getToken();
     return {
@@ -46,11 +72,10 @@ class ApiService {
           body: jsonEncode({'username': username, 'password': password}),
         )
         .timeout(_timeout);
-    final body = jsonDecode(resp.body) as Map<String, dynamic>;
     if (resp.statusCode != 200) {
-      throw ApiException(resp.statusCode, body['error'] ?? 'Login failed');
+      throw ApiException(resp.statusCode, _errorMessage(resp, 'Login failed'));
     }
-    return body;
+    return jsonDecode(resp.body) as Map<String, dynamic>;
   }
 
   static Future<void> triggerGenerate() async {
@@ -58,7 +83,7 @@ class ApiService {
     final headers = await _authHeaders();
     final resp =
         await http.post(Uri.parse('$base/api/generate'), headers: headers).timeout(_timeout);
-    if (resp.statusCode != 200) throw ApiException(resp.statusCode, 'Failed to trigger generation');
+    await _expectOk(resp, 'Failed to trigger generation');
   }
 
   static Future<Map<String, dynamic>> getGenerateStatus({int offset = 0}) async {
@@ -82,7 +107,7 @@ class ApiService {
     final headers = await _authHeaders();
     final resp =
         await http.get(Uri.parse('$base/api/lessons'), headers: headers).timeout(_timeout);
-    if (resp.statusCode != 200) throw ApiException(resp.statusCode, 'Failed to get lessons');
+    await _expectOk(resp, 'Failed to get lessons');
     final data = jsonDecode(resp.body) as Map<String, dynamic>;
     return List<Map<String, dynamic>>.from(data['lessons'] as List);
   }
@@ -93,7 +118,7 @@ class ApiService {
     final resp = await http
         .get(Uri.parse('$base/api/sync/manifest'), headers: headers)
         .timeout(_timeout);
-    if (resp.statusCode != 200) throw ApiException(resp.statusCode, 'Failed to get manifest');
+    await _expectOk(resp, 'Failed to get manifest');
     final data = jsonDecode(resp.body) as Map<String, dynamic>;
     return List<Map<String, dynamic>>.from(data['manifest'] as List);
   }
@@ -101,7 +126,7 @@ class ApiService {
   static Future<http.Response> downloadFile(String relPath) async {
     final base = await _baseUrl();
     final headers = await _authHeaders();
-    final encoded = Uri.encodeFull('$base/api/sync/file/$relPath');
+    final encoded = '$base/api/sync/file/${encodePath(relPath)}';
     return http.get(Uri.parse(encoded), headers: headers).timeout(const Duration(minutes: 2));
   }
 
@@ -117,7 +142,7 @@ class ApiService {
       pathSegments: [...serverUri.pathSegments, 'api', 'sync', 'manifest', lessonBase],
     );
     final resp = await http.get(uri, headers: headers).timeout(_timeout);
-    if (resp.statusCode != 200) throw ApiException(resp.statusCode, 'Failed to get lesson manifest');
+    await _expectOk(resp, 'Failed to get lesson manifest');
     final data = jsonDecode(resp.body) as Map<String, dynamic>;
     return List<Map<String, dynamic>>.from(data['manifest'] as List);
   }
@@ -132,10 +157,7 @@ class ApiService {
           body: jsonEncode({'date': date, 'sentences': sentences}),
         )
         .timeout(_timeout);
-    if (resp.statusCode != 200) {
-      final body = jsonDecode(resp.body) as Map<String, dynamic>;
-      throw ApiException(resp.statusCode, body['error'] ?? 'Failed to add diary entry');
-    }
+    await _expectOk(resp, 'Failed to add diary entry');
   }
 
   static Future<Map<String, String>> fetchTprsKeywords() async {
@@ -143,7 +165,7 @@ class ApiService {
     final headers = await _authHeaders();
     final resp =
         await http.get(Uri.parse('$base/api/config'), headers: headers).timeout(_timeout);
-    if (resp.statusCode != 200) throw ApiException(resp.statusCode, 'Failed to get config');
+    await _expectOk(resp, 'Failed to get config');
     final data = (jsonDecode(resp.body) as Map<String, dynamic>)['tprs'] as Map<String, dynamic>;
     return {
       'sentence': data['sentence'] as String? ?? 'SETNING:',
@@ -158,7 +180,7 @@ class ApiService {
     final headers = await _authHeaders();
     final resp =
         await http.get(Uri.parse('$base/api/config'), headers: headers).timeout(_timeout);
-    if (resp.statusCode != 200) throw ApiException(resp.statusCode, 'Failed to get config');
+    await _expectOk(resp, 'Failed to get config');
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
 
@@ -170,7 +192,8 @@ class ApiService {
     final path = date != null
         ? '$base/api/backfill/drive_mode_audio/${date.replaceAll('/', '-')}'
         : '$base/api/backfill/drive_mode_audio';
-    await http.post(Uri.parse(path), headers: headers).timeout(_timeout);
+    final resp = await http.post(Uri.parse(path), headers: headers).timeout(_timeout);
+    await _expectOk(resp, 'Failed to start Drive Mode audio backfill');
   }
 
   /// Poll the generate status endpoint for Drive Mode generation progress.
@@ -180,7 +203,7 @@ class ApiService {
     final resp = await http
         .get(Uri.parse('$base/api/generate/status?offset=$offset'), headers: headers)
         .timeout(_timeout);
-    if (resp.statusCode != 200) throw ApiException(resp.statusCode, 'Status check failed');
+    await _expectOk(resp, 'Status check failed');
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
 
@@ -200,9 +223,7 @@ class ApiService {
           headers: headers,
         )
         .timeout(_timeout);
-    if (resp.statusCode != 200) {
-      throw ApiException(resp.statusCode, 'Failed to get lesson entries');
-    }
+    await _expectOk(resp, 'Failed to get lesson entries');
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
 
@@ -218,16 +239,17 @@ class ApiService {
           headers: headers,
         )
         .timeout(_timeout);
-    if (resp.statusCode != 200) {
-      throw ApiException(resp.statusCode, 'Failed to get day data');
-    }
+    await _expectOk(resp, 'Failed to get day data');
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
 
   /// Score an individual entry via SM-2.
   /// [score]: 0=Again, 2=Hard, 3=Good, 5=Easy
+  /// [scoredAt] is when the review really happened (used when replaying
+  /// offline reviews so spaced-repetition intervals start from that moment).
   static Future<Map<String, dynamic>> scoreEntry(
-      String date, int entryIndex, int score) async {
+      String date, int entryIndex, int score,
+      {DateTime? scoredAt}) async {
     final base = await _baseUrl();
     final headers = await _authHeaders();
     final resp = await http
@@ -238,12 +260,11 @@ class ApiService {
             'date': date,
             'entry_index': entryIndex,
             'score': score,
+            if (scoredAt != null) 'scored_at': scoredAt.toUtc().toIso8601String(),
           }),
         )
         .timeout(_timeout);
-    if (resp.statusCode != 200) {
-      throw ApiException(resp.statusCode, 'Failed to score entry');
-    }
+    await _expectOk(resp, 'Failed to score entry');
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
 
@@ -251,31 +272,11 @@ class ApiService {
   static Future<Map<String, dynamic>> getHomeData() async {
     final base = await _baseUrl();
     final headers = await _authHeaders();
-    final url = '$base/api/home';
-    debugPrint('[DEBUG] getHomeData: base=$base, url=$url');
-    debugPrint('[DEBUG] getHomeData: headers=$headers');
-    try {
-      final resp = await http
-          .get(Uri.parse(url), headers: headers)
-          .timeout(_timeout);
-      debugPrint('[DEBUG] getHomeData: statusCode=${resp.statusCode}');
-
-      // Handle unauthorized - token might be expired
-      if (resp.statusCode == 401) {
-        debugPrint('[DEBUG] getHomeData: Received 401, clearing session');
-        await AuthService.clearSession();
-        throw ApiException(401, 'Session expired. Please log in again.');
-      }
-
-      if (resp.statusCode != 200) {
-        debugPrint('[DEBUG] getHomeData: response body=${resp.body}');
-        throw ApiException(resp.statusCode, 'Failed to get home data');
-      }
-      return jsonDecode(resp.body) as Map<String, dynamic>;
-    } catch (e) {
-      debugPrint('[DEBUG] getHomeData: exception=$e');
-      rethrow;
-    }
+    final resp = await http
+        .get(Uri.parse('$base/api/home'), headers: headers)
+        .timeout(_timeout);
+    await _expectOk(resp, 'Failed to get home data');
+    return jsonDecode(resp.body) as Map<String, dynamic>;
   }
 
   /// Fetch sentences due for review (Anki-style).
@@ -289,9 +290,7 @@ class ApiService {
       queryParameters: {'limit': '$limit', 'variant': variant},
     );
     final resp = await http.get(uri, headers: headers).timeout(_timeout);
-    if (resp.statusCode != 200) {
-      throw ApiException(resp.statusCode, 'Failed to get due sentences');
-    }
+    await _expectOk(resp, 'Failed to get due sentences');
     final data = jsonDecode(resp.body) as Map<String, dynamic>;
     return List<Map<String, dynamic>>.from(data['sentences'] as List);
   }
@@ -300,9 +299,10 @@ class ApiService {
   static Future<void> triggerQaTranslationBackfill() async {
     final base = await _baseUrl();
     final headers = await _authHeaders();
-    await http
+    final resp = await http
         .post(Uri.parse('$base/api/backfill/qa_translations'), headers: headers)
         .timeout(_timeout);
+    await _expectOk(resp, 'Failed to start Q&A translation backfill');
   }
 
   /// Trigger audio timing backfill (background job on server).
@@ -313,13 +313,14 @@ class ApiService {
   static Future<void> triggerAudioTimingBackfill({bool overwrite = false}) async {
     final base = await _baseUrl();
     final headers = await _authHeaders();
-    await http
+    final resp = await http
         .post(
           Uri.parse('$base/api/backfill/audio_timing'),
           headers: headers,
           body: jsonEncode({'overwrite': overwrite}),
         )
         .timeout(_timeout);
+    await _expectOk(resp, 'Failed to start audio timing backfill');
   }
 
   /// Trigger full maintenance backfill (background job on server).
@@ -327,9 +328,10 @@ class ApiService {
   static Future<void> triggerBackfillAll() async {
     final base = await _baseUrl();
     final headers = await _authHeaders();
-    await http
+    final resp = await http
         .post(Uri.parse('$base/api/backfill/all'), headers: headers)
         .timeout(_timeout);
+    await _expectOk(resp, 'Failed to start full backfill');
   }
 
   /// Get the last_reviewed timestamp for a specific lesson date
@@ -343,9 +345,7 @@ class ApiService {
           headers: headers,
         )
         .timeout(_timeout);
-    if (resp.statusCode != 200) {
-      throw ApiException(resp.statusCode, 'Failed to get lesson last_reviewed');
-    }
+    await _expectOk(resp, 'Failed to get lesson last_reviewed');
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
 
@@ -363,9 +363,7 @@ class ApiService {
           body: jsonEncode(body),
         )
         .timeout(_timeout);
-    if (resp.statusCode != 200) {
-      throw ApiException(resp.statusCode, 'Failed to update lesson last_reviewed');
-    }
+    await _expectOk(resp, 'Failed to update lesson last_reviewed');
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
 
@@ -377,9 +375,7 @@ class ApiService {
       queryParameters: {'limit': '$limit'},
     );
     final resp = await http.get(uri, headers: headers).timeout(_timeout);
-    if (resp.statusCode != 200) {
-      throw ApiException(resp.statusCode, 'Failed to get recently studied lessons');
-    }
+    await _expectOk(resp, 'Failed to get recently studied lessons');
     final data = jsonDecode(resp.body) as Map<String, dynamic>;
     return List<Map<String, dynamic>>.from(data['lessons'] as List);
   }
@@ -389,14 +385,11 @@ class ApiService {
     final headers = await _authHeaders();
     final resp = await http
         .post(
-          Uri.parse('$base/api/diary/$date/trials'),
+          Uri.parse('$base/api/diary/${Uri.encodeComponent(date)}/trials'),
           headers: headers,
           body: jsonEncode({'trials': trials}),
         )
         .timeout(_timeout);
-    if (resp.statusCode != 200) {
-      final body = jsonDecode(resp.body) as Map<String, dynamic>;
-      throw ApiException(resp.statusCode, body['error'] ?? 'Failed to save trials');
-    }
+    await _expectOk(resp, 'Failed to save trials');
   }
 }

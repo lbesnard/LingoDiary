@@ -56,7 +56,7 @@ class SyncManager extends ChangeNotifier {
             : serverUrl;
       }
       await http
-          .get(Uri.parse('$base/api/login'))
+          .get(Uri.parse('$base/api/config'))  // any HTTP answer (even 401) means reachable
           .timeout(const Duration(seconds: 5));
       _setOnline(true);
     } catch (_) {
@@ -67,7 +67,7 @@ class SyncManager extends ChangeNotifier {
   void _setOnline(bool value) {
     _wasOnline = isOnline;
     isOnline = value;
-    notifyListeners();
+    if (_wasOnline != value) notifyListeners();
     if (!_wasOnline && value) {
       // Just came back online — flush pending queue then clean up old rows.
       flushPending();
@@ -82,11 +82,30 @@ class SyncManager extends ChangeNotifier {
     _cancelled = true;
   }
 
+  /// True when the failure means the server can't be reached (retry later).
+  static bool _isNetworkError(Object e) {
+    if (e is TimeoutException) return true;
+    if (e is ApiException) return e.statusCode >= 500 || e.statusCode == 401;
+    // `http` wraps socket failures in a ClientException on some platforms.
+    final text = e.toString();
+    return text.contains('SocketException') ||
+        text.contains('ClientException') ||
+        text.contains('Connection refused') ||
+        text.contains('Failed host lookup');
+  }
+
+  /// True when the server understood the request and rejected it for good
+  /// (e.g. 400/404), so retrying the same queued item can never succeed.
+  static bool _isPermanentRejection(Object e) =>
+      e is ApiException && e.statusCode >= 400 && e.statusCode < 500 && e.statusCode != 401 && e.statusCode != 429;
+
   /// Flushes pending scores, diary entries, lesson reviews, and translation trials to the server.
   /// Safe to call concurrently — a second call is ignored while one is running.
   Future<void> flushPending() async {
     if (_flushing) return;
     _flushing = true;
+    // A user cancelling a download must not permanently disable the outbox.
+    if (!isSyncing) _cancelled = false;
     try {
       await _syncPendingLessonReviews();
       await _syncPendingDiaryEntries();
@@ -213,15 +232,18 @@ class SyncManager extends ChangeNotifier {
     final pending = await LocalDbService.getUnsyncedLessonReviews();
     for (final row in pending) {
       if (_cancelled) break;
+      final date = row['date'] as String;
       try {
-        final date = row['date'] as String;
         final timestamp = row['last_reviewed'] as String;
         await ApiService.updateLessonLastReviewed(date, timestamp: timestamp);
         await LocalDbService.markLessonReviewSynced(date);
       } catch (e) {
-        if (e.toString().contains('SocketException') || e.toString().contains('Connection refused')) {
-          break; // Network unreachable — retry on next sync
+        if (_isPermanentRejection(e)) {
+          debugPrint('SyncManager: dropping rejected lesson review $date: $e');
+          await LocalDbService.markLessonReviewSynced(date);
+          continue;
         }
+        if (_isNetworkError(e)) break; // retry on next sync
         debugPrint('SyncManager: lesson review sync failed for ${row['date']}: $e');
       }
     }
@@ -238,13 +260,18 @@ class SyncManager extends ChangeNotifier {
           row['date'] as String,
           row['entry_index'] as int,
           row['score'] as int,
+          scoredAt: DateTime.tryParse(row['scored_at'] as String? ?? ''),
         );
         await LocalDbService.markScoreSynced(row['id'] as int);
       } catch (e) {
-        // Network unreachable or other error — no point continuing, try again on next sync.
-        if (e.toString().contains('SocketException') || e.toString().contains('Connection refused')) {
-          break;
+        if (_isPermanentRejection(e)) {
+          // e.g. the entry no longer exists: drop it instead of retrying forever.
+          debugPrint('SyncManager: dropping rejected score ${row['id']}: $e');
+          await LocalDbService.markScoreSynced(row['id'] as int);
+          continue;
         }
+        // Network unreachable or other error — no point continuing, try again on next sync.
+        if (_isNetworkError(e)) break; // retry on next sync
         // Log but continue so remaining scores are still attempted.
         debugPrint('SyncManager: score sync failed for row ${row['id']}: $e');
       }
@@ -263,9 +290,12 @@ class SyncManager extends ChangeNotifier {
         await ApiService.addSentences(date, sentences);
         await LocalDbService.markDiarySynced(id);
       } catch (e) {
-        if (e.toString().contains('SocketException') || e.toString().contains('Connection refused')) {
-          break; // Network unreachable — retry on next sync.
+        if (_isPermanentRejection(e)) {
+          debugPrint('SyncManager: dropping rejected diary entry $id: $e');
+          await LocalDbService.markDiarySynced(id);
+          continue;
         }
+        if (_isNetworkError(e)) break; // retry on next sync
         debugPrint('SyncManager: diary entry sync failed for row $id: $e');
       }
     }
@@ -283,9 +313,12 @@ class SyncManager extends ChangeNotifier {
         await ApiService.saveTrials(date, trials);
         await LocalDbService.markTrialSynced(id);
       } catch (e) {
-        if (e.toString().contains('SocketException') || e.toString().contains('Connection refused')) {
-          break;
+        if (_isPermanentRejection(e)) {
+          debugPrint('SyncManager: dropping rejected trials $id: $e');
+          await LocalDbService.markTrialSynced(id);
+          continue;
         }
+        if (_isNetworkError(e)) break; // retry on next sync
         debugPrint('SyncManager: trial sync failed for row $id: $e');
       }
     }

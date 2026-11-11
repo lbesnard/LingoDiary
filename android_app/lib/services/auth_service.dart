@@ -1,4 +1,4 @@
-import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -52,9 +52,7 @@ class AuthService {
   static Future<String?> getToken() async {
     if (kIsWeb) {
       final prefs = await SharedPreferences.getInstance();
-      final token = prefs.getString(_tokenKey);
-      debugPrint('[DEBUG] AuthService.getToken: kIsWeb=true, token=${token == null ? 'null' : 'present (${token.substring(0, 20)}...)'}, keys=${prefs.getKeys()}');
-      return token;
+      return prefs.getString(_tokenKey);
     }
     return _storage.read(key: _tokenKey);
   }
@@ -65,12 +63,7 @@ class AuthService {
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(_tokenKey);
       await prefs.remove(_usernameKey);
-      // Force a longer delay to ensure SharedPreferences is fully updated
-      await Future.delayed(const Duration(milliseconds: 200));
-
-      // Also clear any browser storage that might be cached
       try {
-        // Force a storage event to ensure all tabs/windows are notified
         await prefs.reload();
       } catch (_) {}
     } else {
